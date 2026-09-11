@@ -1,0 +1,32 @@
+[Unit]
+Description=AI Benchmark Lab runner poller (scripted fixtures only)
+Documentation=https://github.com/simaan5/a-lab-harness
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/ablab/poller.env
+ExecStart=/var/lib/ablab-runner/bin/ablab-poller
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=8
+StartLimitIntervalSec=120
+User=root
+Group=root
+WorkingDirectory=/var/lib/ablab-runner
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+# ProtectSystem / DynamicUser / RestrictNamespaces are NOT enabled:
+# this supervisor must drive Docker and write /var/lib/ablab-runner workspaces.
+# Docker group access on this dedicated host is root-equivalent; untrusted
+# workloads still run only inside ablab-cage-run.
+
+[Install]
+WantedBy=multi-user.target

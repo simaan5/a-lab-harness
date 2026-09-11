@@ -2,18 +2,11 @@
 
 Dedicated host only (`hostname` must be `a-lab`).
 
-This is **not** an agent and is **not** connected to the AI Benchmark Lab control plane.
+Cage: **ablab-harness 4.2 / 5.0**. Poller talks to the control plane over **HTTPS outbound only**.
+
 No Claude, Grok, Codex, or provider keys.
 
-## Why `sudo ./install-host.sh` said "command not found"
-
-GitHub stores these scripts as `100644` (not executable). On Ubuntu, `sudo ./file`
-on a non-executable file reports **command not found** even though the file exists.
-That is not a missing installer.
-
-Fix: `chmod +x` first, **or** invoke with `bash`.
-
-## Install + smoke (copy this whole block)
+## Install harness (includes poller binary, does not start it)
 
 ```bash
 cd /tmp
@@ -25,41 +18,34 @@ chmod +x install-host.sh
 sudo ./install-host.sh
 ```
 
-The installer must print matching:
+Confirm SOURCE COMMIT equals INSTALLED COMMIT.
 
-```
-SOURCE COMMIT: <sha>
-INSTALLED COMMIT: <sha>
-INSTALL RESULT: OK
-```
+## Connect the poller (Phase 5)
 
-Only then:
+On the Benchmark Lab **Runners** page: Issue runner token.
+
+On a-lab:
 
 ```bash
-sudo /var/lib/ablab-runner/bin/ablab-harness-selftest smoke
+sudo install -m 0600 /dev/null /etc/ablab/poller.env
+sudo tee /etc/ablab/poller.env >/dev/null <<'EOF'
+ABL_BASE_URL=https://PASTE-CONTROL-PLANE-ORIGIN
+ABL_TOKEN=ablab_rt_PASTE
+ABL_PROTOCOL=ablab.runner.v1
+EOF
+sudo chmod 600 /etc/ablab/poller.env
+sudo chown root:root /etc/ablab/poller.env
+sudo systemctl enable --now ablab-poller
+sudo systemctl status ablab-poller --no-pager
 ```
 
-Do **not** run `full` until smoke prints `SMOKE OK`.
+`ABL_BASE_URL` must be `https://`. The poller refuses HTTP and refuses TLS bypass.
 
-Equivalent if you skip chmod:
-
-```bash
-sudo bash ./install-host.sh
-```
-
-## Runner stdout contract
-
-`ablab-run-attempt` prints **one JSON object** on stdout:
-
-```json
-{"attempt":"<id>","attempt_id":"<id>","result_json":"/var/lib/ablab-runner/evidence/<id>/result.json","evidence_dir":"/var/lib/ablab-runner/evidence/<id>","status":"DESTROYED"}
-```
-
-STATE lines go to stderr. Empty stdout or `evidence//` is a harness error.
+The token is **not** a model API key.
 
 ## Do not
 
-- run agents
-- create `/etc/ablab/poller.env`
-- connect the control plane
-- treat the historical `PASS 21 / FAIL 27` run as cage evidence
+- install agents
+- put Anthropic/OpenAI/xAI keys on this machine
+- open inbound ports for the runner
+- treat fixture results as model rankings
