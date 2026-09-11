@@ -10,6 +10,7 @@ StartLimitIntervalSec=120
 [Service]
 Type=simple
 EnvironmentFile=/etc/ablab/poller.env
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/var/lib/ablab-runner/bin/ablab-poller
 Restart=on-failure
 RestartSec=5
@@ -23,10 +24,8 @@ ProtectHome=true
 LockPersonality=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
-# ProtectSystem / DynamicUser / RestrictNamespaces are NOT enabled:
-# this supervisor must drive Docker and write /var/lib/ablab-runner workspaces.
-# Docker group access on this dedicated host is root-equivalent; untrusted
-# workloads still run only inside ablab-cage-run.
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
