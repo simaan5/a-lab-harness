@@ -35,6 +35,7 @@ need "$SRC/bin/ablab-run-attempt"
 need "$SRC/bin/ablab-harness-selftest"
 need "$SRC/bin/ablab-cage-run"
 need "$SRC/bin/ablab-verify"
+need "$SRC/bin/ablab-poller"
 need "$SRC/lib/analyze.py"
 need "$SRC/lib/common.sh"
 need "$SRC/fixtures/health-service/baseline/src/server.mjs"
@@ -87,8 +88,6 @@ fi
 rm -rf "$ROOT/bin" "$ROOT/lib" "$ROOT/schema" "$ROOT/docs" "$ROOT/fixtures"
 mkdir -p "$ROOT"
 cp -a "$SRC/bin" "$SRC/lib" "$SRC/schema" "$SRC/docs" "$SRC/fixtures" "$ROOT/"
-# Never install a poller from this repo (control-plane freeze).
-rm -f "$ROOT/bin/ablab-poller" "$ROOT/bin/ablab-retest-fails.sh"
 mkdir -p "$ROOT/trusted"
 cp -a "$ROOT/fixtures/health-service/trusted/." "$ROOT/trusted/"
 install -m 0755 "$ROOT/bin/ablab-cage-run" /usr/local/bin/ablab-cage-run
@@ -109,13 +108,18 @@ if [ -d "$SRC/.git" ]; then
 fi
 date -u +%Y-%m-%dT%H:%M:%SZ >"$ROOT/INSTALLED_AT"
 printf '%s\n' "$COMMIT" >"$ROOT/INSTALLED_COMMIT"
-printf 'ablab-harness 4.2\n' >"$ROOT/INSTALLED_VERSION"
+printf 'ablab-harness 5.0\n' >"$ROOT/INSTALLED_VERSION"
 
 echo "Pulling fixture images..."
 docker pull node:20-bookworm-slim
 docker pull debian:bookworm-slim
 docker pull busybox:1.36
 docker rm -f musing_shannon >/dev/null 2>&1 || true
+
+if [ -f "$SRC/systemd/ablab-poller.service" ]; then
+  install -m 0644 "$SRC/systemd/ablab-poller.service" /etc/systemd/system/ablab-poller.service
+  systemctl daemon-reload
+fi
 
 echo
 echo "=================================================="
@@ -127,7 +131,10 @@ ls -l "$ROOT/bin"
 echo "OWNERSHIP: root:root on $ROOT"
 echo "INSTALL RESULT: OK"
 echo "=================================================="
-echo "Confirm SOURCE COMMIT equals INSTALLED COMMIT, then smoke:"
+echo "Confirm SOURCE COMMIT equals INSTALLED COMMIT."
+echo "Cage selftest (optional if already green):"
 echo "  sudo $ROOT/bin/ablab-harness-selftest smoke"
-echo "Do not run full until SMOKE OK."
-echo "Do not create /etc/ablab/poller.env. Do not connect the control plane."
+echo
+echo "Poller is NOT started until /etc/ablab/poller.env exists (root:root 0600)."
+echo "Do not put model API keys in that file."
+echo "Do not enable the service until ABL_BASE_URL is HTTPS."
