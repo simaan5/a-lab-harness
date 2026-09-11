@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Trusted local cancellation. Argument is the poller's own job id — never a host command.
+set -euo pipefail
+JOB="${1:?job id}"
+ROOT="/var/lib/ablab-runner"
+mkdir -p "$ROOT/run/active"
+date -u +%Y-%m-%dT%H:%M:%SZ >"$ROOT/run/cancel-job-${JOB}"
+META="$ROOT/run/active/${JOB}"
+ATT=""
+NAME=""
+PID=""
+if [ -f "$META" ]; then
+  ATT="$(awk -F= '/^ATT=/{print $2}' "$META" | tr -d '\r')"
+  NAME="$(awk -F= '/^NAME=/{print $2}' "$META" | tr -d '\r')"
+  PID="$(awk -F= '/^PID=/{print $2}' "$META" | tr -d '\r')"
+fi
+if [ -n "$ATT" ]; then
+  date -u +%Y-%m-%dT%H:%M:%SZ >"$ROOT/run/cancel-${ATT}"
+fi
+if [ -n "$NAME" ]; then
+  docker rm -f "$NAME" "${NAME}-vbuild" "${NAME}-vvis" "${NAME}-vhid" >/dev/null 2>&1 || true
+fi
+if [ -n "$PID" ] && [ "$PID" -gt 1 ] 2>/dev/null; then
+  kill -TERM "-$PID" >/dev/null 2>&1 || kill -TERM "$PID" >/dev/null 2>&1 || true
+  sleep 1
+  kill -KILL "-$PID" >/dev/null 2>&1 || kill -KILL "$PID" >/dev/null 2>&1 || true
+fi
+pkill -f 'ablab-cancel-parent' >/dev/null 2>&1 || true
+pkill -f 'ablab-cancel-child' >/dev/null 2>&1 || true
+pkill -f 'ablab-cancel-grandchild' >/dev/null 2>&1 || true
+echo "CANCEL invoked for job ${JOB} att=${ATT:-unknown} container=${NAME:-unknown}"
