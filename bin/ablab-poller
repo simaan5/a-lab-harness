@@ -148,7 +148,7 @@ def identity(busy: bool) -> dict:
         "os": f"{platform.system()} {platform.release()}",
         "arch": platform.machine(),
         "cpu": sh(["nproc"]),
-        "runner_software_version": "ablab-poller 5.3",
+        "runner_software_version": "ablab-poller 5.4",
         "harness_version": ver,
         "harness_commit": commit,
         "docker_version": sh(["docker", "version", "--format", "{{.Server.Version}}"]),
@@ -169,17 +169,34 @@ def load_json(path: Path) -> dict:
         return {}
 
 
-def run_attempt(worker: str, timeout: int) -> dict:
-    proc = subprocess.run(
+def supervise_attempt(base: str, token: str, job_id: str, worker: str, timeout: int) -> dict:
+    """Run attempt without blocking heartbeat. Cancel uses trusted local tool only."""
+    env = os.environ.copy()
+    env["ABL_JOB_ID"] = job_id
+    proc = subprocess.Popen(
         [str(ROOT / "bin" / "ablab-run-attempt"), worker, str(timeout)],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
+        env=env,
+        start_new_session=True,
     )
-    stdout = (proc.stdout or "").strip().splitlines()
-    parsed = {}
-    if stdout:
+    cancel_observed_at: str | None = None
+    while proc.poll() is None:
+        code, hb = api(base, token, "/api/runner/heartbeat", identity(True))
+        ids = set((hb or {}).get("cancel_job_ids") or []) if code == 200 else set()
+        if job_id in ids:
+            if cancel_observed_at is None:
+                cancel_observed_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                log(f"cancel observed job={job_id} at={cancel_observed_at}")
+            subprocess.run([str(ROOT / "bin" / "ablab-cancel-attempt"), job_id], check=False)
+        time.sleep(2)
+    stdout, stderr = proc.communicate()
+    lines = (stdout or "").strip().splitlines()
+    parsed: dict = {}
+    if lines:
         try:
-            parsed = json.loads(stdout[-1])
+            parsed = json.loads(lines[-1])
         except json.JSONDecodeError:
             parsed = {}
     evid = Path(str(parsed.get("evidence_dir") or ""))
@@ -193,8 +210,13 @@ def run_attempt(worker: str, timeout: int) -> dict:
         }
     result["kind"] = "HARNESS_TEST"
     result["model"] = None
+    if cancel_observed_at:
+        result["cancelled"] = True
+        result["timeout"] = False
+        result["cancel_observed_at"] = cancel_observed_at
+        result["status"] = "CANCELLED"
     result["_evidence_dir"] = str(evid)
-    result["_stderr"] = (proc.stderr or "")[-4000:]
+    result["_stderr"] = (stderr or "")[-4000:]
     return result
 
 
@@ -239,7 +261,7 @@ def main() -> None:
         die("BLOCKED — STABLE HTTPS CONTROL-PLANE ENDPOINT REQUIRED")
     if token.startswith("sk-") or "anthropic" in token.lower() or "openai" in token.lower():
         die("Refusing provider/model API keys in poller.env")
-    log("ablab-poller 5.3 starting. Agents are not integrated.")
+    log("ablab-poller 5.4 starting. Agents are not integrated.")
     log(f"base={base}")
     busy = False
     last_hb_log = 0.0
@@ -296,8 +318,10 @@ def main() -> None:
         timeout = 30 if worker != "timeout" else 8
         if worker == "memory":
             timeout = 25
-        result = run_attempt(worker, timeout)
-        log(f"attempt done job={job_id} status={result.get('status')!r}")
+        if worker == "child_process":
+            timeout = 90
+        result = supervise_attempt(base, token, job_id, worker, timeout)
+        log(f"attempt done job={job_id} status={result.get('status')!r} cancelled={result.get('cancelled')!r}")
         post_artifacts(base, token, job_id, result)
         busy = False
         time.sleep(1)
