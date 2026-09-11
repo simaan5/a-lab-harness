@@ -1,0 +1,21 @@
+{
+  "$id": "ablab.claim.v1",
+  "title": "AI Benchmark Lab worker claim",
+  "type": "object",
+  "required": ["schema", "status", "claims"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": { "const": "ablab.claim.v1" },
+    "status": { "enum": ["complete", "failed", "error"] },
+    "claims": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["task_complete", "build_passed", "tests_passed"],
+      "properties": {
+        "task_complete": { "type": "boolean" },
+        "build_passed": { "type": "boolean" },
+        "tests_passed": { "type": "boolean" }
+      }
+    }
+  }
+}

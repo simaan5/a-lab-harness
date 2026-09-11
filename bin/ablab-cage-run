@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Enforced isolated docker run for AI Benchmark Lab.
+# Workloads never get a host shell, docker CLI, or docker.sock.
+set -euo pipefail
+ROOT="/var/lib/ablab-runner"
+argv=("$@")
+n=${#argv[@]}
+i=0
+passthru=()
+while [ "$i" -lt "$n" ]; do
+  a="${argv[$i]}"
+  case "$a" in
+    --privileged|--privileged=true|--pid=host|--network=host|--net=host|--ipc=host|--uts=host|--userns=host|--network=bridge|--net=bridge|-p|--publish|--publish-all|-P|--device|--device-cgroup-rule|--network|--net)
+      echo "REJECTED: $a is forbidden in the cage" >&2
+      exit 2
+      ;;
+    --network=*|--net=*|--publish=*|--device=*)
+      echo "REJECTED: $a is forbidden in the cage" >&2
+      exit 2
+      ;;
+    -v|--volume)
+      i=$((i + 1))
+      spec="${argv[$i]:-}"
+      case "$spec" in
+        ${ROOT}/workspaces/*:/workspace|${ROOT}/workspaces/*:/workspace:rw|${ROOT}/workspaces/*:/workspace:ro)
+          passthru+=(-v "$spec")
+          ;;
+        ${ROOT}/trusted:/trusted:ro|${ROOT}/trusted/*:/trusted:ro)
+          passthru+=(-v "$spec")
+          ;;
+        *)
+          echo "REJECTED: bind $spec is forbidden in the cage" >&2
+          exit 2
+          ;;
+      esac
+      ;;
+    --mount)
+      echo "REJECTED: --mount is forbidden; use approved -v only" >&2
+      exit 2
+      ;;
+    *)
+      if printf '%s' "$a" | grep -Eq 'docker\.sock'; then
+        echo "REJECTED: docker.sock is forbidden in the cage" >&2
+        exit 2
+      fi
+      passthru+=("$a")
+      ;;
+  esac
+  i=$((i + 1))
+done
+
+exec docker run \
+  --network none \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  --pids-limit 256 \
+  --memory 2g \
+  --cpus 2 \
+  --read-only \
+  --tmpfs /tmp:rw,nosuid,nodev,size=256m \
+  --tmpfs /run:rw,nosuid,nodev,size=16m \
+  "${passthru[@]}"
