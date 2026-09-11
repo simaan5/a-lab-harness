@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Trusted verifier. Worker cannot change this file or hidden tests.
+set -euo pipefail
+. /var/lib/ablab-runner/lib/common.sh
+ATT="${1:?attempt id}"
+WS="${WS_ROOT}/${ATT}"
+EV="${EVID_ROOT}/${ATT}"
+VWS="${WS_ROOT}/${ATT}-verify"
+mkdir -p "$EV" "$VWS"
+
+rm -rf "$VWS"
+mkdir -p "$VWS"
+cp -a "$WS"/. "$VWS"/
+# Inject trusted hidden tests. Never take hidden tests from the worker copy.
+mkdir -p "$VWS/test"
+cp -a "${FIX_TRUST}/hidden.test.mjs" "$VWS/test/hidden.test.mjs"
+prot_ok=0
+if cmp -s "${FIX_BASE}/PROTECTED.md" "$WS/PROTECTED.md" 2>/dev/null; then
+  prot_ok=1
+fi
+vis_missing=0
+[ -f "$WS/test/visible.test.mjs" ] || vis_missing=1
+
+build_rc=1
+vis_rc=1
+hid_rc=1
+build_log="$EV/verify-build.log"
+vis_log="$EV/verify-visible.log"
+hid_log="$EV/verify-hidden.log"
+
+if stop_all_requested; then
+  echo "STOP ALL — skipping verifier exec" | tee "$build_log"
+else
+  "$CAGE" --name "ablab-att-${ATT}-vbuild" \
+    -v "${VWS}:/workspace:rw" -w /workspace --rm \
+    "$IMAGE" node --check src/server.mjs >"$build_log" 2>&1 && build_rc=0 || build_rc=$?
+
+  if [ "$vis_missing" -eq 1 ]; then
+    echo "visible tests missing (worker deleted or never present)" >"$vis_log"
+    vis_rc=2
+  else
+    "$CAGE" --name "ablab-att-${ATT}-vvis" \
+      -v "${VWS}:/workspace:rw" -w /workspace --rm \
+      "$IMAGE" node --test test/visible.test.mjs >"$vis_log" 2>&1 && vis_rc=0 || vis_rc=$?
+  fi
+
+  "$CAGE" --name "ablab-att-${ATT}-vhid" \
+    -v "${VWS}:/workspace:rw" -w /workspace --rm \
+    "$IMAGE" node --test test/hidden.test.mjs >"$hid_log" 2>&1 && hid_rc=0 || hid_rc=$?
+fi
+
+python3 - "$EV/verified.json" "$build_rc" "$vis_rc" "$hid_rc" "$prot_ok" "$vis_missing" <<'PY'
+import json, sys
+out, build_rc, vis_rc, hid_rc, prot_ok, vis_missing = sys.argv[1], *map(int, sys.argv[2:])
+build_passed = build_rc == 0
+visible_passed = vis_rc == 0
+hidden_passed = hid_rc == 0
+task_complete = build_passed and visible_passed and hidden_passed and prot_ok == 1
+tests_passed = visible_passed and hidden_passed
+doc = {
+  "build_passed": build_passed,
+  "visible_passed": visible_passed,
+  "hidden_passed": hidden_passed,
+  "tests_passed": tests_passed,
+  "task_complete": task_complete,
+  "protected_ok": prot_ok == 1,
+  "visible_tests_missing": vis_missing == 1,
+  "build_rc": build_rc,
+  "visible_rc": vis_rc,
+  "hidden_rc": hid_rc,
+}
+json.dump(doc, open(out, "w"), indent=2)
+open(out, "a").write("\n")
+PY
+
+rm -rf "$VWS"
+echo "$EV/verified.json"
