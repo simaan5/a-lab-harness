@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Install the a-lab scripted fixture harness.
-# Usage (does NOT require the file to be executable):
+#
+# GitHub stores this file as 100644 (not executable).
+# These both work:
+#   chmod +x ./install-host.sh && sudo ./install-host.sh
 #   sudo bash ./install-host.sh
 set -euo pipefail
 
@@ -16,11 +19,14 @@ fi
 
 SRC="$(cd "$(dirname "$0")" && pwd)"
 ROOT="/var/lib/ablab-runner"
+chmod a+x "$0" 2>/dev/null || true
 
 need() {
   if [ ! -e "$1" ]; then
     echo "INSTALL FAIL: missing $1" >&2
-    echo "Run: sudo bash ./install-host.sh   (from the cloned repo)" >&2
+    echo "From the cloned repo run:" >&2
+    echo "  chmod +x ./install-host.sh && sudo ./install-host.sh" >&2
+    echo "  OR: sudo bash ./install-host.sh" >&2
     exit 1
   fi
 }
@@ -33,6 +39,17 @@ need "$SRC/lib/analyze.py"
 need "$SRC/lib/common.sh"
 need "$SRC/fixtures/health-service/baseline/src/server.mjs"
 need "$SRC/fixtures/workers/good.mjs"
+
+# Refuse to install the pre-4.2 selftest that json.loads a filesystem path.
+if ! grep -q 'parse_runner' "$SRC/bin/ablab-harness-selftest"; then
+  echo "INSTALL FAIL: selftest in this checkout is stale (missing parse_runner)." >&2
+  echo "git fetch && git checkout main && git pull" >&2
+  exit 1
+fi
+if ! grep -q '"attempt_id"' "$SRC/bin/ablab-run-attempt"; then
+  echo "INSTALL FAIL: ablab-run-attempt in this checkout is stale (no JSON stdout contract)." >&2
+  exit 1
+fi
 
 echo "Installing harness from $SRC -> $ROOT"
 
@@ -70,10 +87,13 @@ fi
 rm -rf "$ROOT/bin" "$ROOT/lib" "$ROOT/schema" "$ROOT/docs" "$ROOT/fixtures"
 mkdir -p "$ROOT"
 cp -a "$SRC/bin" "$SRC/lib" "$SRC/schema" "$SRC/docs" "$SRC/fixtures" "$ROOT/"
+# Never install a poller from this repo (control-plane freeze).
+rm -f "$ROOT/bin/ablab-poller" "$ROOT/bin/ablab-retest-fails.sh"
 mkdir -p "$ROOT/trusted"
 cp -a "$ROOT/fixtures/health-service/trusted/." "$ROOT/trusted/"
 install -m 0755 "$ROOT/bin/ablab-cage-run" /usr/local/bin/ablab-cage-run
 chmod 0755 "$ROOT/bin/"* "$ROOT/lib/analyze.py" "$ROOT/lib/common.sh"
+# Strip CRLF if GitHub/Windows ever injects them.
 sed -i 's/\r$//' "$ROOT/bin/"* "$ROOT/lib/common.sh" "$ROOT/lib/analyze.py" || true
 chown -R root:root "$ROOT"
 chmod 0755 "$ROOT" "$ROOT/workspaces" "$ROOT/evidence" "$ROOT/run"
@@ -89,7 +109,7 @@ if [ -d "$SRC/.git" ]; then
 fi
 date -u +%Y-%m-%dT%H:%M:%SZ >"$ROOT/INSTALLED_AT"
 printf '%s\n' "$COMMIT" >"$ROOT/INSTALLED_COMMIT"
-printf 'ablab-harness 4.1\n' >"$ROOT/INSTALLED_VERSION"
+printf 'ablab-harness 4.2\n' >"$ROOT/INSTALLED_VERSION"
 
 echo "Pulling fixture images..."
 docker pull node:20-bookworm-slim
@@ -107,6 +127,7 @@ ls -l "$ROOT/bin"
 echo "OWNERSHIP: root:root on $ROOT"
 echo "INSTALL RESULT: OK"
 echo "=================================================="
-echo "Smoke next:"
+echo "Confirm SOURCE COMMIT equals INSTALLED COMMIT, then smoke:"
 echo "  sudo $ROOT/bin/ablab-harness-selftest smoke"
+echo "Do not run full until SMOKE OK."
 echo "Do not create /etc/ablab/poller.env. Do not connect the control plane."

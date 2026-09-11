@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Lifecycle: ALLOCATING -> PREPARING -> READY -> EXECUTING -> COLLECTING -> VERIFYING -> CLEANING -> DESTROYED
+# Lifecycle: ALLOCATING → PREPARING → READY → EXECUTING → COLLECTING → VERIFYING → CLEANING → DESTROYED
 # stdout: ONE JSON object (last/only line). Everything else is stderr.
 set +e
 set -u
@@ -14,6 +14,9 @@ SECRET="${ABL_TEST_SECRET:-}"
 ATT="t$(date +%s%N 2>/dev/null || date +%s)$(openssl rand -hex 3 2>/dev/null || echo x$$)"
 if [ -z "$ATT" ] || [ "$ATT" = "t" ]; then
   ATT="t$(python3 -c 'import time,os; print("%s%s" % (int(time.time()*1000), os.getpid()))')"
+fi
+if [ -z "$ATT" ] || [ "$ATT" = "t" ]; then
+  ATT="t${RANDOM}${RANDOM}$$"
 fi
 WS="${WS_ROOT}/${ATT}"
 EV="${EVID_ROOT}/${ATT}"
@@ -38,7 +41,7 @@ PY
 
 if stop_all_requested; then
   printf '%s\n' "{\"attempt\":\"$ATT\",\"attempt_id\":\"$ATT\",\"state\":\"REFUSED_STOP_ALL\"}" >"$EV/result.json"
-  emit REFUSED_STOP_ALL
+  emit REFUSED_STOP_ALL || printf '{"attempt":"%s","attempt_id":"%s","status":"REFUSED_STOP_ALL"}\n' "$ATT" "$ATT"
   exit 3
 fi
 
@@ -53,7 +56,7 @@ cp -a "$FIX_BASE"/. "$WS"/
 mkdir -p "$WS/.ablab"
 if [ ! -f "${WORKERS}/${WORKER_ID}.mjs" ]; then
   echo "ERROR: unknown worker $WORKER_ID" >&2
-  emit ERROR
+  emit ERROR || printf '{"attempt":"%s","attempt_id":"%s","status":"ERROR"}\n' "$ATT" "$ATT"
   exit 2
 fi
 cp -a "${WORKERS}/${WORKER_ID}.mjs" "$WS/.ablab/worker.mjs"
@@ -170,9 +173,13 @@ doc = {
   "end": "$end_iso",
   "workspace_destroyed": (not os.path.isdir("$WS")) if "$KEEP" != "1" else False,
 }
-json.dump(doc, open(path, "w"), indent=2)
-open(path, "a").write("\\n")
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(doc, f, indent=2)
+    f.write(chr(10))
 PY
 
 st="$(cat "$EV/state" 2>/dev/null || echo UNKNOWN)"
-emit "$st"
+if ! emit "$st"; then
+  printf '{"attempt":"%s","attempt_id":"%s","status":"%s"}\n' "$ATT" "$ATT" "$st"
+fi
+exit 0
