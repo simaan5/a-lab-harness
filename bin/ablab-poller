@@ -41,6 +41,19 @@ ALLOWED = {
 PROTOCOL = "ablab.runner.v1"
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Do not follow 302 login gates; surface the status to the operator."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+OPENER = urllib.request.build_opener(
+    NoRedirect(),
+    urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+)
+
+
 def die(msg: str, code: int = 1) -> None:
     print(msg, file=sys.stderr)
     raise SystemExit(code)
@@ -72,36 +85,67 @@ def redact(s: str, token: str) -> str:
     return out
 
 
-def api(base: str, token: str, path: str, payload: dict | None = None) -> tuple[int, dict]:
+def looks_like_login_gate(code: int, raw: str, parsed: dict) -> bool:
+    if code in (301, 302, 303, 307, 308):
+        return True
+    blob = (raw or "")[:800].lower() + json.dumps(parsed).lower()
+    return any(
+        marker in blob
+        for marker in (
+            "preview-auth",
+            "<html",
+            "<!doctype",
+            "login",
+            "sign in",
+            "cloudflare",
+        )
+    ) and "protocol_version" not in parsed
+
+
+def parse_body(raw: str) -> dict:
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {"error": "non_object"}
+    except json.JSONDecodeError:
+        return {"error": "non_json", "body": raw[:160].replace("\n", " ")}
+
+
+def api(base: str, token: str, path: str, payload: dict | None = None, method: str = "POST") -> tuple[int, dict]:
     url = base.rstrip("/") + path
-    body = json.dumps(payload or {}).encode()
+    body = None if method == "GET" else json.dumps(payload or {}).encode()
     req = urllib.request.Request(
         url,
         data=body,
-        method="POST",
+        method=method,
         headers={
             "Authorization": "Bearer " + token,
             "Content-Type": "application/json",
             "Accept": "application/json",
         },
     )
-    ctx = ssl.create_default_context()
     try:
-        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+        with OPENER.open(req, timeout=30) as resp:
             raw = resp.read().decode("utf-8", "replace")
-            return resp.status, json.loads(raw) if raw else {}
+            parsed = parse_body(raw)
+            if looks_like_login_gate(resp.status, raw, parsed):
+                parsed["error"] = parsed.get("error") or "login_gate"
+            return resp.status, parsed
     except urllib.error.HTTPError as e:
         raw = e.read().decode("utf-8", "replace")
-        try:
-            parsed = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            parsed = {"error": "http_error", "body": raw[:200]}
+        parsed = parse_body(raw)
+        loc = e.headers.get("Location") if e.headers else None
+        if loc:
+            parsed["location"] = loc.split("?")[0]
+        if looks_like_login_gate(e.code, raw, parsed):
+            parsed["error"] = "login_gate"
         return e.code, parsed
     except ssl.SSLError as e:
         die(f"TLS failure talking to {base}: {e}. Do not disable certificate verification.")
     except urllib.error.URLError as e:
         print(f"control plane unreachable: {e}", file=sys.stderr)
-        return 0, {}
+        return 0, {"error": "unreachable"}
 
 
 def sh(cmd: list[str]) -> str:
@@ -122,7 +166,7 @@ def identity(busy: bool) -> dict:
         "cpu": sh(["nproc"]),
         "ram": sh(["bash", "-lc", "free -b | awk '/Mem:/{print $2}'"]),
         "disk": sh(["bash", "-lc", "df -B1 / | awk 'NR==2{print $4}'"]),
-        "runner_software_version": "ablab-poller 5.0",
+        "runner_software_version": "ablab-poller 5.1",
         "harness_version": ver,
         "harness_commit": commit,
         "docker_version": sh(["docker", "version", "--format", "{{.Server.Version}}"]),
@@ -213,8 +257,19 @@ def main() -> None:
         die("BLOCKED — STABLE HTTPS CONTROL-PLANE ENDPOINT REQUIRED")
     if token.startswith("sk-") or "anthropic" in token.lower() or "openai" in token.lower():
         die("Refusing provider/model API keys in poller.env")
-    print("ablab-poller 5.0 starting. Agents are not integrated.", file=sys.stderr)
+    print("ablab-poller 5.1 starting. Agents are not integrated.", file=sys.stderr)
+    proto_code, proto = api(base, token, "/api/runner/protocol", method="GET")
+    print(
+        f"protocol probe http={proto_code} protocol={proto.get('protocol_version')!r} error={proto.get('error')!r} location={proto.get('location')!r}",
+        file=sys.stderr,
+    )
+    if proto.get("error") == "login_gate" or proto_code in (301, 302, 303, 307, 308):
+        print(
+            "BLOCKED — STABLE HTTPS CONTROL-PLANE ENDPOINT REQUIRED: URL is login-gated (Grok preview), not a runner API.",
+            file=sys.stderr,
+        )
     busy = False
+    last_gate = 0.0
     while True:
         if STOP_FLAG.is_file() and not busy:
             time.sleep(5)
@@ -227,6 +282,21 @@ def main() -> None:
         if code == 409:
             print("incompatible protocol", file=sys.stderr)
             time.sleep(15)
+            continue
+        if code != 200 or hb.get("error"):
+            now = time.time()
+            if now - last_gate > 20:
+                print(
+                    f"heartbeat http={code} error={hb.get('error')!r} location={hb.get('location')!r}",
+                    file=sys.stderr,
+                )
+                if hb.get("error") == "login_gate" or code in (301, 302, 303, 307, 308):
+                    print(
+                        "BLOCKED: this ABL_BASE_URL requires a browser login. a-lab cannot use it.",
+                        file=sys.stderr,
+                    )
+                last_gate = now
+            time.sleep(10)
             continue
         if hb.get("stop_all"):
             subprocess.run([str(ROOT / "bin" / "ablab-stop-all")], check=False)

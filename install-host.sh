@@ -108,7 +108,7 @@ if [ -d "$SRC/.git" ]; then
 fi
 date -u +%Y-%m-%dT%H:%M:%SZ >"$ROOT/INSTALLED_AT"
 printf '%s\n' "$COMMIT" >"$ROOT/INSTALLED_COMMIT"
-printf 'ablab-harness 5.0\n' >"$ROOT/INSTALLED_VERSION"
+printf 'ablab-harness 5.1\n' >"$ROOT/INSTALLED_VERSION"
 
 echo "Pulling fixture images..."
 docker pull node:20-bookworm-slim

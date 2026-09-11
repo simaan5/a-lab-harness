@@ -4,6 +4,8 @@ Documentation=https://github.com/simaan5/a-lab-harness
 After=docker.service network-online.target
 Wants=network-online.target
 Requires=docker.service
+StartLimitBurst=8
+StartLimitIntervalSec=120
 
 [Service]
 Type=simple
@@ -11,8 +13,6 @@ EnvironmentFile=/etc/ablab/poller.env
 ExecStart=/var/lib/ablab-runner/bin/ablab-poller
 Restart=on-failure
 RestartSec=5
-StartLimitBurst=8
-StartLimitIntervalSec=120
 User=root
 Group=root
 WorkingDirectory=/var/lib/ablab-runner
