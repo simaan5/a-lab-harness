@@ -10,6 +10,7 @@ WORKER_ID="${1:?worker id e.g. good}"
 TIMEOUT_SECS="${2:-20}"
 KEEP="${ABL_KEEP_WORKSPACE:-0}"
 SECRET="${ABL_TEST_SECRET:-}"
+JOB_ID="${ABL_JOB_ID:-}"
 
 ATT="t$(date +%s%N 2>/dev/null || date +%s)$(openssl rand -hex 3 2>/dev/null || echo x$$)"
 if [ -z "$ATT" ] || [ "$ATT" = "t" ]; then
@@ -64,6 +65,10 @@ cp -a "${WORKERS}/${WORKER_ID}.mjs" "$WS/.ablab/worker.mjs"
 : >"$EV/stderr.raw"
 
 state READY
+if [ -n "$JOB_ID" ]; then
+  mkdir -p "${ROOT}/run/active"
+  printf 'ATT=%s\nNAME=%s\nPID=%s\n' "$ATT" "$NAME" "$$" >"${ROOT}/run/active/${JOB_ID}"
+fi
 cat >"$manifest" <<EOF
 {
   "attempt": "${ATT}",
@@ -97,6 +102,11 @@ exec_rc=$?
 end_s=$(date +%s)
 if [ "$exec_rc" -eq 124 ] || [ "$exec_rc" -eq 137 ] || [ "$exec_rc" -eq 143 ]; then
   timeout_hit=1
+fi
+if [ -f "${ROOT}/run/cancel-${ATT}" ] || { [ -n "$JOB_ID" ] && [ -f "${ROOT}/run/cancel-job-${JOB_ID}" ]; }; then
+  cancelled=1
+  timeout_hit=0
+  docker rm -f "$NAME" >/dev/null 2>&1
 fi
 if stop_all_requested; then
   cancelled=1
@@ -135,6 +145,9 @@ python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("pro
 state CLEANING
 docker rm -f "$NAME" >/dev/null 2>&1
 docker rm -f "${NAME}-vbuild" "${NAME}-vvis" "${NAME}-vhid" >/dev/null 2>&1
+if [ -n "$JOB_ID" ]; then
+  rm -f "${ROOT}/run/active/${JOB_ID}"
+fi
 rm -rf "${WS_ROOT}/${ATT}-verify"
 canary_ok=1
 if [ -f /etc/ablab/HOST_CANARY.txt ]; then
@@ -179,7 +192,11 @@ with open(path, "w", encoding="utf-8") as f:
 PY
 
 st="$(cat "$EV/state" 2>/dev/null || echo UNKNOWN)"
-if ! emit "$st"; then
-  printf '{"attempt":"%s","attempt_id":"%s","status":"%s"}\n' "$ATT" "$ATT" "$st"
+out_status="$st"
+if [ "$cancelled" -eq 1 ]; then
+  out_status="CANCELLED"
+fi
+if ! emit "$out_status"; then
+  printf '{"attempt":"%s","attempt_id":"%s","status":"%s"}\n' "$ATT" "$ATT" "$out_status"
 fi
 exit 0
