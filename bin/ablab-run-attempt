@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Lifecycle: ALLOCATING -> PREPARING -> READY -> EXECUTING -> COLLECTING -> VERIFYING -> CLEANING -> DESTROYED
-# stdout: ONLY the path to result.json. Everything else is stderr.
+# stdout: ONE JSON object (last/only line). Everything else is stderr.
 set +e
 set -u
 . /var/lib/ablab-runner/lib/common.sh
@@ -11,16 +11,34 @@ TIMEOUT_SECS="${2:-20}"
 KEEP="${ABL_KEEP_WORKSPACE:-0}"
 SECRET="${ABL_TEST_SECRET:-}"
 
-ATT="t$(date +%s%N | cut -c1-13)"
+ATT="t$(date +%s%N 2>/dev/null || date +%s)$(openssl rand -hex 3 2>/dev/null || echo x$$)"
+if [ -z "$ATT" ] || [ "$ATT" = "t" ]; then
+  ATT="t$(python3 -c 'import time,os; print("%s%s" % (int(time.time()*1000), os.getpid()))')"
+fi
 WS="${WS_ROOT}/${ATT}"
 EV="${EVID_ROOT}/${ATT}"
 NAME="ablab-att-${ATT}"
 mkdir -p "$WS" "$EV" "${ROOT}/run"
-state() { printf '%s\n' "$1" >"$EV/state"; printf 'STATE %s\n' "$1" >&2; }
+state() { printf '%s\n' "$1" >"$EV/state"; printf 'STATE %s %s\n' "$1" "$ATT" >&2; }
+
+emit() {
+  python3 - "$ATT" "$EV/result.json" "${1:-unknown}" <<'PY'
+import json, os, sys
+att, path, status = sys.argv[1], sys.argv[2], sys.argv[3]
+doc = {
+  "attempt": att,
+  "attempt_id": att,
+  "result_json": path,
+  "evidence_dir": os.path.dirname(path),
+  "status": status,
+}
+print(json.dumps(doc, separators=(",", ":")))
+PY
+}
 
 if stop_all_requested; then
-  printf '%s\n' "{\"attempt\":\"$ATT\",\"state\":\"REFUSED_STOP_ALL\"}" >"$EV/result.json"
-  echo "$EV/result.json"
+  printf '%s\n' "{\"attempt\":\"$ATT\",\"attempt_id\":\"$ATT\",\"state\":\"REFUSED_STOP_ALL\"}" >"$EV/result.json"
+  emit REFUSED_STOP_ALL
   exit 3
 fi
 
@@ -33,6 +51,11 @@ manifest="${EV}/manifest.json"
 state PREPARING
 cp -a "$FIX_BASE"/. "$WS"/
 mkdir -p "$WS/.ablab"
+if [ ! -f "${WORKERS}/${WORKER_ID}.mjs" ]; then
+  echo "ERROR: unknown worker $WORKER_ID" >&2
+  emit ERROR
+  exit 2
+fi
 cp -a "${WORKERS}/${WORKER_ID}.mjs" "$WS/.ablab/worker.mjs"
 : >"$EV/stdout.raw"
 : >"$EV/stderr.raw"
@@ -132,6 +155,7 @@ import json, os, sys
 path = sys.argv[1]
 doc = {
   "attempt": "$ATT",
+  "attempt_id": "$ATT",
   "worker_id": "$WORKER_ID",
   "kind": "HARNESS_TEST",
   "model": None,
@@ -147,7 +171,8 @@ doc = {
   "workspace_destroyed": (not os.path.isdir("$WS")) if "$KEEP" != "1" else False,
 }
 json.dump(doc, open(path, "w"), indent=2)
-open(path, "a").write("\n")
+open(path, "a").write("\\n")
 PY
 
-echo "$EV/result.json"
+st="$(cat "$EV/state" 2>/dev/null || echo UNKNOWN)"
+emit "$st"
