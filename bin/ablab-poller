@@ -108,6 +108,7 @@ def api(base: str, token: str, path: str, payload: dict | None = None, method: s
             "Authorization": "Bearer " + token,
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "User-Agent": "curl/8.5.0",
         },
     )
     try:
@@ -147,7 +148,7 @@ def identity(busy: bool) -> dict:
         "os": f"{platform.system()} {platform.release()}",
         "arch": platform.machine(),
         "cpu": sh(["nproc"]),
-        "runner_software_version": "ablab-poller 5.2",
+        "runner_software_version": "ablab-poller 5.3",
         "harness_version": ver,
         "harness_commit": commit,
         "docker_version": sh(["docker", "version", "--format", "{{.Server.Version}}"]),
@@ -238,7 +239,7 @@ def main() -> None:
         die("BLOCKED — STABLE HTTPS CONTROL-PLANE ENDPOINT REQUIRED")
     if token.startswith("sk-") or "anthropic" in token.lower() or "openai" in token.lower():
         die("Refusing provider/model API keys in poller.env")
-    log("ablab-poller 5.2 starting. Agents are not integrated.")
+    log("ablab-poller 5.3 starting. Agents are not integrated.")
     log(f"base={base}")
     busy = False
     last_hb_log = 0.0
@@ -252,7 +253,7 @@ def main() -> None:
         code, hb = api(base, token, "/api/runner/heartbeat", ident)
         now = time.time()
         if now - last_hb_log > 15 or code != 200:
-            log(f"heartbeat http={code} ok={hb.get('ok')!r} error={hb.get('error')!r}")
+            log(f"heartbeat http={code} ok={hb.get('ok')!r} error={hb.get('error')!r} body={str(hb)[:180]!r}")
             last_hb_log = now
         if code == 401:
             log("heartbeat unauthorized (credential rejected)")
