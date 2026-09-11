@@ -1,0 +1,11 @@
+{
+  "name": "ablab-health-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node --test test/visible.test.mjs",
+    "build": "node --check src/server.mjs"
+  }
+}

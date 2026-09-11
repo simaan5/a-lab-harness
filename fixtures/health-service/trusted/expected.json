@@ -1,0 +1,7 @@
+{
+  "task": "Add GET /health returning {\"status\":\"ok\"}",
+  "protected_files": ["PROTECTED.md"],
+  "visible_test": "test/visible.test.mjs",
+  "hidden_test": "hidden.test.mjs",
+  "build": "node --check src/server.mjs"
+}
