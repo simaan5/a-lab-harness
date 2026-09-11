@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""Outbound poller: a-lab -> control plane. Scripted fixtures only. No agents."""
+from __future__ import annotations
+
+import json
+import os
+import platform
+import socket
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT = Path("/var/lib/ablab-runner")
+ENVF = Path("/etc/ablab/poller.env")
+STOP_FLAG = ROOT / "run" / "STOP_ALL"
+ALLOWED = {
+    "good",
+    "noop",
+    "test_fail",
+    "build_fail",
+    "false_claim",
+    "delete_test",
+    "modify_protected",
+    "hardcode",
+    "secret_leak",
+    "network",
+    "host_read",
+    "host_write",
+    "child_process",
+    "timeout",
+    "crash",
+    "bad_claim",
+    "memory",
+    "pidbomb",
+    "tamper_verifier",
+}
+PROTOCOL = "ablab.runner.v1"
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(msg, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def load_env() -> dict[str, str]:
+    if not ENVF.is_file():
+        die(f"Missing {ENVF} (ABL_BASE_URL and ABL_TOKEN)")
+    if ENVF.stat().st_mode & 0o077:
+        die(f"{ENVF} must be mode 0600")
+    data: dict[str, str] = {}
+    for line in ENVF.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        data[k.strip()] = v.strip().strip('"').strip("'")
+    return data
+
+
+def redact(s: str, token: str) -> str:
+    out = s.replace(token, "[REDACTED]")
+    while "ablab_rt_" in out:
+        i = out.find("ablab_rt_")
+        j = i + 9
+        while j < len(out) and out[j] in "0123456789abcdefABCDEF":
+            j += 1
+        out = out[:i] + "[REDACTED]" + out[j:]
+    return out
+
+
+def api(base: str, token: str, path: str, payload: dict | None = None) -> tuple[int, dict]:
+    url = base.rstrip("/") + path
+    body = json.dumps(payload or {}).encode()
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": "Bearer " + token,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    ctx = ssl.create_default_context()
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            return resp.status, json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        try:
+            parsed = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            parsed = {"error": "http_error", "body": raw[:200]}
+        return e.code, parsed
+    except ssl.SSLError as e:
+        die(f"TLS failure talking to {base}: {e}. Do not disable certificate verification.")
+    except urllib.error.URLError as e:
+        print(f"control plane unreachable: {e}", file=sys.stderr)
+        return 0, {}
+
+
+def sh(cmd: list[str]) -> str:
+    try:
+        return subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        return "unknown"
+
+
+def identity(busy: bool) -> dict:
+    commit = (ROOT / "INSTALLED_COMMIT").read_text().strip() if (ROOT / "INSTALLED_COMMIT").is_file() else "unknown"
+    ver = (ROOT / "INSTALLED_VERSION").read_text().strip() if (ROOT / "INSTALLED_VERSION").is_file() else "unknown"
+    return {
+        "protocol_version": PROTOCOL,
+        "hostname": socket.gethostname(),
+        "os": f"{platform.system()} {platform.release()}",
+        "arch": platform.machine(),
+        "cpu": sh(["nproc"]),
+        "ram": sh(["bash", "-lc", "free -b | awk '/Mem:/{print $2}'"]),
+        "disk": sh(["bash", "-lc", "df -B1 / | awk 'NR==2{print $4}'"]),
+        "runner_software_version": "ablab-poller 5.0",
+        "harness_version": ver,
+        "harness_commit": commit,
+        "docker_version": sh(["docker", "version", "--format", "{{.Server.Version}}"]),
+        "cage_path": "/usr/local/bin/ablab-cage-run",
+        "supported_fixtures": sorted(ALLOWED),
+        "busy": busy,
+        "agents": "not_integrated",
+    }
+
+
+def load_json(path: Path) -> dict:
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def run_attempt(worker: str, timeout: int) -> dict:
+    proc = subprocess.run(
+        [str(ROOT / "bin" / "ablab-run-attempt"), worker, str(timeout)],
+        capture_output=True,
+        text=True,
+    )
+    stdout = (proc.stdout or "").strip().splitlines()
+    parsed = {}
+    if stdout:
+        try:
+            parsed = json.loads(stdout[-1])
+        except json.JSONDecodeError:
+            parsed = {}
+    evid = Path(str(parsed.get("evidence_dir") or ""))
+    result = load_json(evid / "result.json") if evid else {}
+    if not result:
+        result = {
+            "kind": "HARNESS_TEST",
+            "model": None,
+            "status": parsed.get("status") or "ERROR",
+            "attempt_id": parsed.get("attempt_id") or parsed.get("attempt"),
+        }
+    result["kind"] = "HARNESS_TEST"
+    result["model"] = None
+    result["_evidence_dir"] = str(evid)
+    result["_stderr"] = (proc.stderr or "")[-4000:]
+    return result
+
+
+def post_artifacts(base: str, token: str, job_id: str, result: dict) -> None:
+    evid = Path(str(result.pop("_evidence_dir", "") or ""))
+    api(base, token, "/api/runner/events", {"job_id": job_id, "seq": 2, "kind": "COLLECTED", "payload": {"attempt": result.get("attempt_id")}})
+    stdout = ""
+    if evid.is_dir():
+        stdout_path = evid / "stdout.txt"
+        if stdout_path.is_file():
+            stdout = redact(stdout_path.read_text(errors="replace")[:60_000], token)
+        for kind, name in (
+            ("result", "result.json"),
+            ("verified", "verified.json"),
+            ("score", "score.json"),
+            ("manifest", "manifest.json"),
+            ("claim", "claim.parsed.json"),
+        ):
+            payload = load_json(evid / name)
+            if payload:
+                api(base, token, "/api/runner/evidence", {"job_id": job_id, "kind": kind, "payload": payload})
+                if kind == "score":
+                    result["score"] = payload
+                if kind == "verified":
+                    result["verified"] = payload
+    if stdout:
+        api(base, token, "/api/runner/logs", {"job_id": job_id, "seq": 1, "body": stdout})
+    result.pop("_stderr", None)
+    api(base, token, "/api/runner/complete", {"job_id": job_id, "result": result})
+    api(base, token, "/api/runner/cleanup", {"job_id": job_id, "kind": "job"})
+
+
+def main() -> None:
+    if socket.gethostname() != "a-lab":
+        die(f"refusing to run on {socket.gethostname()}; expected a-lab")
+    env = load_env()
+    base = env.get("ABL_BASE_URL", "").rstrip("/")
+    token = env.get("ABL_TOKEN", "")
+    if not base or not token:
+        die("ABL_BASE_URL and ABL_TOKEN required")
+    if not base.startswith("https://"):
+        die("BLOCKED — STABLE HTTPS CONTROL-PLANE ENDPOINT REQUIRED")
+    if token.startswith("sk-") or "anthropic" in token.lower() or "openai" in token.lower():
+        die("Refusing provider/model API keys in poller.env")
+    print("ablab-poller 5.0 starting. Agents are not integrated.", file=sys.stderr)
+    busy = False
+    while True:
+        if STOP_FLAG.is_file() and not busy:
+            time.sleep(5)
+            continue
+        code, hb = api(base, token, "/api/runner/heartbeat", identity(busy))
+        if code == 401:
+            print("heartbeat unauthorized (credential rejected)", file=sys.stderr)
+            time.sleep(8)
+            continue
+        if code == 409:
+            print("incompatible protocol", file=sys.stderr)
+            time.sleep(15)
+            continue
+        if hb.get("stop_all"):
+            subprocess.run([str(ROOT / "bin" / "ablab-stop-all")], check=False)
+            api(base, token, "/api/runner/cleanup", {"kind": "stop_all"})
+            busy = False
+            time.sleep(2)
+            continue
+        cancels = set(hb.get("cancel_job_ids") or [])
+        code, claimed = api(base, token, "/api/runner/claim", {"protocol_version": PROTOCOL})
+        job = (claimed or {}).get("job") if code == 200 else None
+        if not job:
+            time.sleep(4)
+            continue
+        job_id = job.get("id")
+        worker = str(job.get("worker_id") or "")
+        if worker not in ALLOWED or job.get("kind") != "HARNESS_TEST":
+            api(base, token, "/api/runner/complete", {"job_id": job_id, "result": {"kind": "HARNESS_TEST", "model": None}, "error": "unknown_fixture"})
+            continue
+        if job_id in cancels:
+            api(base, token, "/api/runner/complete", {"job_id": job_id, "result": {"kind": "HARNESS_TEST", "model": None, "cancelled": True}})
+            continue
+        print(f"claimed {job_id} worker={worker}", file=sys.stderr)
+        busy = True
+        api(base, token, "/api/runner/events", {"job_id": job_id, "seq": 1, "kind": "CLAIMED", "payload": {"worker": worker}})
+        timeout = 30 if worker != "timeout" else 8
+        if worker == "memory":
+            timeout = 25
+        result = run_attempt(worker, timeout)
+        post_artifacts(base, token, job_id, result)
+        busy = False
+        time.sleep(1)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        raise SystemExit(0)
