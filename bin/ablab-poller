@@ -148,7 +148,7 @@ def identity(busy: bool) -> dict:
         "os": f"{platform.system()} {platform.release()}",
         "arch": platform.machine(),
         "cpu": sh(["nproc"]),
-        "runner_software_version": "ablab-poller 5.4",
+        "runner_software_version": "ablab-poller 5.5",
         "harness_version": ver,
         "harness_commit": commit,
         "docker_version": sh(["docker", "version", "--format", "{{.Server.Version}}"]),
@@ -258,17 +258,23 @@ def main() -> None:
     if not base or not token:
         die("ABL_BASE_URL and ABL_TOKEN required")
     if not base.startswith("https://"):
-        die("BLOCKED — STABLE HTTPS CONTROL-PLANE ENDPOINT REQUIRED")
+        die("BLOCKED \u2014 STABLE HTTPS CONTROL-PLANE ENDPOINT REQUIRED")
     if token.startswith("sk-") or "anthropic" in token.lower() or "openai" in token.lower():
         die("Refusing provider/model API keys in poller.env")
-    log("ablab-poller 5.4 starting. Agents are not integrated.")
+    log("ablab-poller 5.5 starting. Agents are not integrated.")
     log(f"base={base}")
     busy = False
     last_hb_log = 0.0
     while True:
         if STOP_FLAG.is_file() and not busy:
+            code, hb = api(base, token, "/api/runner/heartbeat", identity(True))
+            if code == 200 and hb.get("resume"):
+                STOP_FLAG.unlink(missing_ok=True)
+                api(base, token, "/api/runner/cleanup", {"kind": "resume"})
+                log("resume observed; local STOP_ALL cleared")
+                time.sleep(1)
+                continue
             log("local STOP_ALL flag present; heartbeat only, not claiming")
-            api(base, token, "/api/runner/heartbeat", identity(True))
             time.sleep(5)
             continue
         ident = identity(busy)
