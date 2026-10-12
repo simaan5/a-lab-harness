@@ -6,7 +6,9 @@ date -u +%Y-%m-%dT%H:%M:%SZ > "$ROOT/run/STOP_ALL"
 # Cancel scripted fixture containers only.
 ids="$(docker ps -aq --filter name=ablab-att- || true)"
 if [ -n "$ids" ]; then
+  # shellcheck disable=SC2086
   docker stop -t 2 $ids >/dev/null 2>&1 || true
+  # shellcheck disable=SC2086
   docker rm -f $ids >/dev/null 2>&1 || true
 fi
 echo "STOP ALL set. Scripted fixture containers terminated."

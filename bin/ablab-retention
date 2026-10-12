@@ -7,7 +7,7 @@ ROOT="/var/lib/ablab-runner"
 EV="$ROOT/evidence"
 DAYS="${ABL_EVIDENCE_DAYS:-30}"
 MAXMB="${ABL_EVIDENCE_MAX_MB:-2048}"
-[[ "$DAYS" =~ ^[0-9]+$ ]] && [[ "$MAXMB" =~ ^[0-9]+$ ]] || { echo "bad limits" >&2; exit 2; }
+if ! [[ "$DAYS" =~ ^[0-9]+$ ]] || ! [[ "$MAXMB" =~ ^[0-9]+$ ]]; then echo "bad limits" >&2; exit 2; fi
 [ -d "$EV" ] || { echo '{"retention":"no_evidence_dir"}'; exit 0; }
 aged=0
 while IFS= read -r -d '' d; do
