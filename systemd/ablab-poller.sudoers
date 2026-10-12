@@ -1,0 +1,4 @@
+# /etc/sudoers.d/ablab-poller — the non-root poller may run exactly these trusted helpers as root.
+# Validate with: visudo -cf /etc/sudoers.d/ablab-poller
+Defaults:ablab !requiretty, env_reset
+ablab ALL=(root) NOPASSWD: /var/lib/ablab-runner/bin/ablab-run-attempt *, /var/lib/ablab-runner/bin/ablab-cancel-attempt *, /var/lib/ablab-runner/bin/ablab-stop-all, /var/lib/ablab-runner/bin/ablab-resume

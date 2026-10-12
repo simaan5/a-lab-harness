@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Clear the local STOP_ALL flag (called by the poller when the control plane says resume).
+set -euo pipefail
+rm -f /var/lib/ablab-runner/run/STOP_ALL
+echo "STOP_ALL cleared"

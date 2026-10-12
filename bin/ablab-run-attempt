@@ -27,6 +27,9 @@ if ! needs_verify="$(worker_field "$WORKER_ID" verify)"; then
 fi
 needs_secret="$(worker_field "$WORKER_ID" secret)"
 mount_trusted="$(worker_field "$WORKER_ID" mount_trusted)"
+if [ "$needs_secret" = "true" ] && [ -z "$SECRET" ]; then
+  SECRET="ABL_TEST_SECRET_$(openssl rand -hex 12)"   # synthetic, per attempt
+fi
 [ -n "$TIMEOUT_SECS" ] || TIMEOUT_SECS="$(worker_field "$WORKER_ID" timeout)"
 [[ "$TIMEOUT_SECS" =~ ^[0-9]{1,4}$ ]] || TIMEOUT_SECS=30
 
@@ -227,6 +230,11 @@ PY
 
 # Redact every evidence file (all encodings of the synthetic secret, runner tokens).
 python3 "$PY" redact-dir "$EV" "$SECRET" "$EV/redaction.meta.json" >/dev/null 2>&1
+
+# Non-root poller (group ablab) may read evidence; nobody else can.
+if getent group ablab >/dev/null 2>&1; then
+  chgrp -R ablab "$EV" && chmod -R g+rX,o-rwx "$EV"
+fi
 
 out_status="$(cat "$EV/state" 2>/dev/null || echo UNKNOWN)"
 [ "$cancelled" -eq 1 ] && out_status="CANCELLED"
