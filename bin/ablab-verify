@@ -1,77 +1,99 @@
 #!/usr/bin/env bash
-# Trusted verifier. Worker cannot change this file or hidden tests.
+# Trusted verifier. Worker code and test code never share a process or container:
+#   vbuild : node --check on a read-only copy (parse only, never executes worker code)
+#   vsrv   : worker server launched by trusted /trusted/serve.mjs on a unix socket
+#   vvis/vhid : trusted test client (no workspace mount) talks to the socket; TAP parsed by name
+# Protected files are checked by sha256 against the trusted baseline.
 set -euo pipefail
 . /var/lib/ablab-runner/lib/common.sh
 ATT="${1:?attempt id}"
+[[ "$ATT" =~ ^t[0-9a-zA-Z]+$ ]] || die "bad attempt id"
 WS="${WS_ROOT}/${ATT}"
 EV="${EVID_ROOT}/${ATT}"
 VWS="${WS_ROOT}/${ATT}-verify"
-mkdir -p "$EV" "$VWS"
-
-rm -rf "$VWS"
-mkdir -p "$VWS"
+SOCK="${SOCK_ROOT}/${ATT}"
+NAME="ablab-att-${ATT}"
+mkdir -p "$EV"
+rm -rf "$VWS" "$SOCK"
+mkdir -p "$VWS" "$SOCK"
 cp -a "$WS"/. "$VWS"/
-# Inject trusted hidden tests. Never take hidden tests from the worker copy.
-mkdir -p "$VWS/test"
-cp -a "${FIX_TRUST}/hidden.test.mjs" "$VWS/test/hidden.test.mjs"
-prot_ok=0
-if cmp -s "${FIX_BASE}/PROTECTED.md" "$WS/PROTECTED.md" 2>/dev/null; then
-  prot_ok=1
-fi
+chown_for_cage "$VWS" "$SOCK"
+chmod 0700 "$SOCK"
+
+trusted_before="$(sha_tree "$FIX_TRUST")"
+python3 "$PY" protected-check "$FIX_BASE" "$WS" "$FIX_TRUST/expected.json" "$EV/protected.json"
 vis_missing=0
 [ -f "$WS/test/visible.test.mjs" ] || vis_missing=1
 
-build_rc=1
-vis_rc=1
-hid_rc=1
+python3 -c 'import json,sys; json.dump(json.load(open(sys.argv[1]))["expected_visible_tests"], open(sys.argv[2],"w"))' "$FIX_TRUST/expected.json" "$EV/.exp-vis.json"
+python3 -c 'import json,sys; json.dump(json.load(open(sys.argv[1]))["expected_hidden_tests"], open(sys.argv[2],"w"))' "$FIX_TRUST/expected.json" "$EV/.exp-hid.json"
+
 build_log="$EV/verify-build.log"
-vis_log="$EV/verify-visible.log"
-hid_log="$EV/verify-hidden.log"
+vis_log="$EV/verify-visible.tap"
+hid_log="$EV/verify-hidden.tap"
+srv_log="$EV/verify-server.log"
+: >"$vis_log"; : >"$hid_log"
+build_rc=1
+
+cleanup() { docker rm -f "${NAME}-vsrv" "${NAME}-vbuild" "${NAME}-vvis" "${NAME}-vhid" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
 
 if stop_all_requested; then
   echo "STOP ALL — skipping verifier exec" | tee "$build_log"
 else
-  "$CAGE" --name "ablab-att-${ATT}-vbuild" \
-    -v "${VWS}:/workspace:rw" -w /workspace --rm \
+  "$CAGE" --name "${NAME}-vbuild" -v "${VWS}:/workspace:ro" -w /workspace --rm \
     "$IMAGE" node --check src/server.mjs >"$build_log" 2>&1 && build_rc=0 || build_rc=$?
 
-  if [ "$vis_missing" -eq 1 ]; then
-    echo "visible tests missing (worker deleted or never present)" >"$vis_log"
-    vis_rc=2
-  else
-    "$CAGE" --name "ablab-att-${ATT}-vvis" \
-      -v "${VWS}:/workspace:rw" -w /workspace --rm \
-      "$IMAGE" node --test test/visible.test.mjs >"$vis_log" 2>&1 && vis_rc=0 || vis_rc=$?
-  fi
+  "$CAGE" --name "${NAME}-vsrv" -d -v "${VWS}:/workspace:ro" -v "${TRUSTED}:/trusted:ro" \
+    -v "${SOCK}:/sock:rw" -e ABL_SOCK=/sock/app.sock -w /workspace \
+    "$IMAGE" node /trusted/serve.mjs >/dev/null 2>&1 || true
 
-  "$CAGE" --name "ablab-att-${ATT}-vhid" \
-    -v "${VWS}:/workspace:rw" -w /workspace --rm \
-    "$IMAGE" node --test test/hidden.test.mjs >"$hid_log" 2>&1 && hid_rc=0 || hid_rc=$?
+  timeout 60 "$CAGE" --name "${NAME}-vvis" --rm -v "${TRUSTED}:/trusted:ro" -v "${SOCK}:/sock:rw" \
+    -e ABL_SOCK=/sock/app.sock -w /trusted \
+    "$IMAGE" node --test-reporter=tap /trusted/visible.test.mjs >"$vis_log" 2>&1 || true
+  timeout 60 "$CAGE" --name "${NAME}-vhid" --rm -v "${TRUSTED}:/trusted:ro" -v "${SOCK}:/sock:rw" \
+    -e ABL_SOCK=/sock/app.sock -w /trusted \
+    "$IMAGE" node --test-reporter=tap /trusted/hidden.test.mjs >"$hid_log" 2>&1 || true
+  docker logs "${NAME}-vsrv" 2>&1 | head -c 65536 >"$srv_log" || true
 fi
+cleanup
 
-python3 - "$EV/verified.json" "$build_rc" "$vis_rc" "$hid_rc" "$prot_ok" "$vis_missing" <<'PY'
-import json, sys
-out, build_rc, vis_rc, hid_rc, prot_ok, vis_missing = sys.argv[1], *map(int, sys.argv[2:])
+python3 "$PY" parse-tap "$vis_log" "$EV/.exp-vis.json" "$EV/verify-visible.json"
+python3 "$PY" parse-tap "$hid_log" "$EV/.exp-hid.json" "$EV/verify-hidden.json"
+trusted_after="$(sha_tree "$FIX_TRUST")"
+
+python3 - "$EV" "$build_rc" "$vis_missing" "$trusted_before" "$trusted_after" <<'PY'
+import json, os, sys
+ev, build_rc, vis_missing, tb, ta = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], sys.argv[5]
+load = lambda n: json.load(open(os.path.join(ev, n)))
+prot = load("protected.json")
+vis = load("verify-visible.json")
+hid = load("verify-hidden.json")
 build_passed = build_rc == 0
-visible_passed = vis_rc == 0
-hidden_passed = hid_rc == 0
-task_complete = build_passed and visible_passed and hidden_passed and prot_ok == 1
-tests_passed = visible_passed and hidden_passed
+visible_passed = vis["passed"] and not vis_missing
+hidden_passed = hid["passed"]
+trusted_intact = tb == ta
 doc = {
   "build_passed": build_passed,
   "visible_passed": visible_passed,
   "hidden_passed": hidden_passed,
-  "tests_passed": tests_passed,
-  "task_complete": task_complete,
-  "protected_ok": prot_ok == 1,
+  "tests_passed": visible_passed and hidden_passed,
+  "task_complete": build_passed and visible_passed and hidden_passed and prot["protected_ok"] and trusted_intact,
+  "protected_ok": prot["protected_ok"],
+  "protected": prot,
   "visible_tests_missing": vis_missing == 1,
+  "visible_tests": vis["tests"],
+  "hidden_tests": hid["tests"],
   "build_rc": build_rc,
-  "visible_rc": vis_rc,
-  "hidden_rc": hid_rc,
+  "trusted_sha_before": tb,
+  "trusted_sha_after": ta,
+  "trusted_intact": trusted_intact,
+  "method": "tap-by-name/black-box-socket/v2",
 }
-json.dump(doc, open(out, "w"), indent=2)
-open(out, "a").write("\n")
+with open(os.path.join(ev, "verified.json"), "w") as f:
+    json.dump(doc, f, indent=2)
+    f.write("\n")
 PY
-
-rm -rf "$VWS"
+rm -f "$EV/.exp-vis.json" "$EV/.exp-hid.json"
+rm -rf "$VWS" "$SOCK"
 echo "$EV/verified.json"
