@@ -1,0 +1,4 @@
+# Digest-pinned images. The cage refuses any image not listed here.
+# Update deliberately: docker pull <tag> && docker image inspect --format '{{index .RepoDigests 0}}'
+node=node:20-bookworm-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0
+debian=debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
