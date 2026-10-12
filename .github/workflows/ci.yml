@@ -41,6 +41,9 @@ jobs:
         run: sudo ABL_ALLOW_HOST=ci /var/lib/ablab-runner/bin/ablab-harness-selftest smoke
       - name: selftest full
         run: sudo ABL_ALLOW_HOST=ci /var/lib/ablab-runner/bin/ablab-harness-selftest full
+      - name: make report readable
+        if: always()
+        run: sudo chmod -R a+rX /var/lib/ablab-runner/evidence || true
       - name: upload selftest report
         if: always()
         uses: actions/upload-artifact@v4
