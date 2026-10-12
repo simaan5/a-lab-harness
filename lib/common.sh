@@ -33,6 +33,11 @@ stop_all_requested() {
   [ -f "$STOP_FLAG" ]
 }
 
+# "on" if dockerd runs with userns-remap, else "off".
+userns_mode() {
+  if docker info --format '{{.SecurityOptions}}' 2>/dev/null | grep -q 'name=userns'; then echo on; else echo off; fi
+}
+
 # Host uid that the container's uid 65534 maps to (differs under userns-remap).
 cage_host_uid() {
   local base

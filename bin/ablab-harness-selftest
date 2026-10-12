@@ -136,6 +136,18 @@ start_attempt() {
 
 summary_and_exit() {
   local title="$1"
+  python3 - "${ROOT}/evidence/HARNESS_READINESS_$(date -u +%Y%m%dT%H%M%SZ).json" "$MODE" "$USERNS" "$PASS" "$FAIL" "$ERROR" "$BLOCKED" \
+    "$(cat "$ROOT/INSTALLED_COMMIT" 2>/dev/null || echo unknown)" "$REPORT" <<'PYR'
+import json, sys
+out, mode, userns, p, f, e, b, commit, report = sys.argv[1:]
+doc = {"kind": "HARNESS_TEST", "model": None, "ranking_eligible": False, "mode": mode,
+       "userns_remap": userns, "userns_warning": userns == "off",
+       "pass": int(p), "fail": int(f), "error": int(e), "blocked": int(b),
+       "installed_commit": commit, "report": report}
+json.dump(doc, open(out, "w"), indent=2)
+print(out)
+PYR
+  note "Readiness evidence written (userns_remap=$USERNS)"
   note ""
   note "=================================================="
   note "$title"
@@ -154,6 +166,11 @@ note "INSTALLED_COMMIT=$(cat "$ROOT/INSTALLED_COMMIT" 2>/dev/null || echo unknow
 note "INSTALLED_VERSION=$(cat "$ROOT/INSTALLED_VERSION" 2>/dev/null || echo unknown)"
 note "SECRET=$ABL_TEST_SECRET  (synthetic only)"
 note "WORKDIR=$WORKDIR"
+USERNS="$(userns_mode)"
+note "userns_remap=$USERNS"
+if [ "$USERNS" = "off" ]; then
+  note "WARNING: userns_remap=off — container uid 65534 maps to host uid 65534 (ABL_USERNS_REMAP=0 install). Other cage hardening still enforced."
+fi
 note "=================================================="
 
 # --- identity of three IDs ---
@@ -183,6 +200,7 @@ if start_attempt good 30; then
     expect_eq "$(jget "$EV/score.json" score.kind)" "HARNESS_TEST" "GOOD scoring labeled HARNESS_TEST"
     expect_eq "$(jget "$EV/score.json" score.ranking_eligible)" "False" "GOOD ranking_eligible false"
     expect_eq "$(jget "$EV/score.json" score.model)" "None" "GOOD model null"
+    expect_eq "$(jget "$EV/manifest.json" userns_remap)" "$USERNS" "GOOD manifest records userns_remap=$USERNS"
     expect_eq "$(jget "$RESULT" ranking_eligible)" "False" "GOOD result ranking_eligible false"
     expect_eq "$(jget "$EV/verified.json" "hidden_tests.GET /health returns {status:ok}")" "ok" "GOOD named hidden test ok"
     expect_eq "$(jget "$EV/verified.json" trusted_intact)" "True" "GOOD trusted files intact"

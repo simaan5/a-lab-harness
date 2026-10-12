@@ -143,3 +143,62 @@ Local pure-data integration only. `kind: HARNESS_TEST`, `ranking_eligible: false
 - No control-plane connection yet.
 - No real AI agents.
 - Fixture is a tiny Node health-endpoint, not a production app.
+
+## a-lab upgrade with userns-remap OFF (shared host)
+
+a-lab also hosts other projects' images and containers (listing-prep-studio contract images,
+postgres, a buildx builder). `userns-remap` would hide them (Docker stores remapped data under a
+separate root), so install with `ABL_USERNS_REMAP=0`. All other cage hardening still applies.
+The installer backs up and **merges** `/etc/docker/daemon.json` (existing keys kept; `icc:false` and
+`no-new-privileges:true` enforced; `userns-remap` never added in this mode, never removed) and
+restarts Docker **only** if `daemon.json` or the dockerd drop-in actually changed. With
+`live-restore: true`, running containers survive that restart.
+
+Note: daemon-wide `no-new-privileges` also applies to the other projects' containers (setuid
+helpers such as `su`/`sudo` inside them stop gaining privileges). Check them after install.
+
+### 1. Pause and back up
+```bash
+sudo systemctl stop ablab-poller || true
+sudo /var/lib/ablab-runner/bin/ablab-stop-all
+TS=$(date -u +%Y%m%dT%H%M%SZ); BK=/root/ablab-backup-$TS; sudo mkdir -p "$BK"
+sudo tar -C / -czf "$BK/ablab.tgz" --ignore-failed-read \
+  var/lib/ablab-runner/bin var/lib/ablab-runner/lib var/lib/ablab-runner/fixtures \
+  var/lib/ablab-runner/trusted var/lib/ablab-runner/schema var/lib/ablab-runner/docs \
+  var/lib/ablab-runner/INSTALLED_COMMIT var/lib/ablab-runner/INSTALLED_VERSION \
+  usr/local/bin/ablab-cage-run etc/systemd/system/ablab-poller.service \
+  etc/docker/daemon.json etc/systemd/system/docker.service.d etc/ablab/poller.env
+sudo docker ps -a --format '{{.Names}} {{.Status}}' | sudo tee "$BK/containers-before.txt"
+echo "backup: $BK"
+```
+
+### 2. Install the branch
+```bash
+cd /tmp && rm -rf a-lab-harness && git clone https://github.com/simaan5/a-lab-harness.git
+cd a-lab-harness && git checkout hardening/audit-2026-10-12 && git rev-parse HEAD
+sudo ABL_USERNS_REMAP=0 bash ./install-host.sh
+sudo docker ps -a --format '{{.Names}} {{.Status}}' | diff "$BK/containers-before.txt" - && echo "containers unchanged"
+```
+
+### 3. Selftest (expect `userns_remap=off` warning, FAIL 0 / ERROR 0)
+```bash
+sudo /var/lib/ablab-runner/bin/ablab-harness-selftest smoke && \
+sudo /var/lib/ablab-runner/bin/ablab-harness-selftest full
+sudo sh -c 'cat $(ls -t /var/lib/ablab-runner/evidence/HARNESS_READINESS_*.json | head -1)'
+```
+Leave the poller stopped until review; then `sudo systemctl enable --now ablab-poller`
+(it now runs as user `ablab`; installer already chowned `/etc/ablab/poller.env`).
+
+### 4. Roll back
+```bash
+sudo systemctl stop ablab-poller || true
+sudo /var/lib/ablab-runner/bin/ablab-stop-all || true
+sudo systemctl disable --now ablab-retention.timer 2>/dev/null || true
+sudo rm -f /etc/sudoers.d/ablab-poller /etc/systemd/system/ablab-retention.{service,timer}
+sudo cp -a /etc/docker/daemon.json /root/daemon.json.after-branch
+sudo tar -C / -xzf "$BK/ablab.tgz"
+sudo chown root:root /etc/ablab/poller.env && sudo chmod 600 /etc/ablab/poller.env
+sudo systemctl daemon-reload
+cmp -s /etc/docker/daemon.json /root/daemon.json.after-branch || sudo systemctl restart docker
+sudo /var/lib/ablab-runner/bin/ablab-harness-selftest smoke
+```

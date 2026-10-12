@@ -102,6 +102,7 @@ cat >"$manifest" <<EOF2
   "image": "${IMAGE}",
   "image_id": "${image_id}",
   "network": "none",
+  "userns_remap": "$(userns_mode)",
   "user": "65534:65534",
   "memory": "2g",
   "memory_swap": "2g",
