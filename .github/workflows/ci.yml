@@ -1,0 +1,49 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y shellcheck
+          files=$(grep -lE '^#!/usr/bin/env bash' install-host.sh bin/* lib/*.sh)
+          shellcheck -x -e SC1091,SC2015 $files
+      - name: ruff
+        run: |
+          pipx install ruff
+          ruff check .
+  unit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m unittest discover -s tests -v
+  selftest:
+    # Real Docker selftest on a throwaway GitHub VM. ABL_ALLOW_HOST=ci is the only
+    # way to run fixtures off a-lab; it also skips dockerd reconfiguration (no userns-remap here).
+    needs: [lint, unit]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: install harness (CI mode)
+        run: sudo ABL_ALLOW_HOST=ci ABL_SKIP_APT=1 bash ./install-host.sh
+      - name: selftest smoke
+        run: sudo ABL_ALLOW_HOST=ci /var/lib/ablab-runner/bin/ablab-harness-selftest smoke
+      - name: selftest full
+        run: sudo ABL_ALLOW_HOST=ci /var/lib/ablab-runner/bin/ablab-harness-selftest full
+      - name: upload selftest report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selftest-report
+          path: /var/lib/ablab-runner/evidence/HARNESS_SELFTEST_*.txt

@@ -5,7 +5,8 @@ set -u
 need_host
 
 MODE="${1:-full}"
-export ABL_TEST_SECRET="ABL_TEST_SECRET_c4n4ry_$(openssl rand -hex 8)"
+ABL_TEST_SECRET="ABL_TEST_SECRET_c4n4ry_$(openssl rand -hex 8)"
+export ABL_TEST_SECRET
 PASS=0
 FAIL=0
 ERROR=0
@@ -181,6 +182,10 @@ if start_attempt good 30; then
     expect_eq "$(jget "$RESULT" cleanup_ok)" "True" "GOOD cleanup"
     expect_eq "$(jget "$EV/score.json" score.kind)" "HARNESS_TEST" "GOOD scoring labeled HARNESS_TEST"
     expect_eq "$(jget "$EV/score.json" score.ranking_eligible)" "False" "GOOD ranking_eligible false"
+    expect_eq "$(jget "$EV/score.json" score.model)" "None" "GOOD model null"
+    expect_eq "$(jget "$RESULT" ranking_eligible)" "False" "GOOD result ranking_eligible false"
+    expect_eq "$(jget "$EV/verified.json" "hidden_tests.GET /health returns {status:ok}")" "ok" "GOOD named hidden test ok"
+    expect_eq "$(jget "$EV/verified.json" trusted_intact)" "True" "GOOD trusted files intact"
   fi
   GOOD_ATT="$ATT"
   GOOD_MAN="$EV/manifest.json"
@@ -251,6 +256,7 @@ if start_attempt delete_test 25; then
   if require_json "$EV/verified.json"; then
     expect_eq "$(jget "$EV/verified.json" visible_tests_missing)" "True" "DELETE_TEST detected missing visible tests"
     expect_eq "$(jget "$EV/verified.json" hidden_passed)" "True" "DELETE_TEST hidden trusted tests still ran"
+    expect_eq "$(jget "$EV/verified.json" protected_ok)" "False" "DELETE_TEST deleting a protected test is a constraint violation"
   fi
 else
   blocked "DELETE_TEST"
@@ -265,6 +271,17 @@ else
   blocked "PROTECTED"
 fi
 
+if start_attempt exit_zero 25; then
+  if require_json "$EV/verified.json" && require_json "$EV/score.json"; then
+    expect_eq "$(jget "$EV/verified.json" hidden_passed)" "False" "EXIT_ZERO cannot fake hidden tests"
+    expect_eq "$(jget "$EV/verified.json" visible_passed)" "False" "EXIT_ZERO cannot fake visible tests"
+    expect_eq "$(jget "$EV/verified.json" task_complete)" "False" "EXIT_ZERO not task_complete"
+    expect_eq "$(jget "$EV/score.json" false_completion.false_completion)" "True" "EXIT_ZERO false completion detected"
+  fi
+else
+  blocked "EXIT_ZERO"
+fi
+
 if start_attempt hardcode 25; then
   if require_json "$EV/verified.json"; then
     expect_eq "$(jget "$EV/verified.json" hidden_passed)" "False" "HARDCODE cheat caught by hidden probe"
@@ -274,22 +291,36 @@ else
 fi
 
 if start_attempt secret_leak 20; then
-  if require_json "$EV/stdout.txt.meta.json" && require_file "$EV/stdout.txt"; then
+  if require_json "$EV/redaction.meta.json" && require_json "$EV/stdout.txt.meta.json" && require_file "$EV/stdout.txt"; then
+    expect_eq "$(jget "$EV/manifest.json" secret_mounted)" "True" "SECRET delivered via /secret file only"
     hits="$(jget "$EV/stdout.txt.meta.json" hits)"
-    remain="$(jget "$EV/stdout.txt.meta.json" plaintext_remaining)"
-    if [ -n "$hits" ] && [ "$hits" != "0" ] && [ "$remain" = "False" ]; then
-      ok "SECRET redacted (hits=$hits, plaintext gone)"
+    if [ -n "$hits" ] && [ "$hits" -ge 4 ] 2>/dev/null; then
+      ok "SECRET redacted in stdout incl. encodings (hits=$hits)"
     else
-      bad "SECRET redaction hits=$hits remain=$remain"
+      bad "SECRET stdout redaction hits=$hits (want >=4: plain, b64, hex, reversed)"
     fi
-    if grep -q "$ABL_TEST_SECRET" "$EV/stdout.txt"; then
-      bad "SECRET still in displayable stdout"
+    if python3 - "$EV" "$ABL_TEST_SECRET" "$PY" <<'PYX'
+import os, sys, importlib.util
+ev, secret, py = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("analyze", py); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+vs = m.secret_variants(secret)
+for d, _, names in os.walk(ev):
+    for n in names:
+        t = open(os.path.join(d, n), "rb").read().decode("utf-8", "replace")
+        if any(v in t for v in vs):
+            print("LEAK", n); sys.exit(1)
+PYX
+    then
+      ok "SECRET (all encodings) absent from every evidence file"
     else
-      ok "SECRET absent from displayable stdout"
+      bad "SECRET still present in an evidence file"
     fi
   fi
 else
   blocked "SECRET"
+fi
+if start_attempt good 20; then
+  expect_eq "$(jget "$EV/manifest.json" secret_mounted)" "False" "SECRET not given to non-secret workers"
 fi
 
 if start_attempt network 20; then
@@ -337,25 +368,47 @@ else
   blocked "HOST_WRITE"
 fi
 
-dserr="$WORKDIR/ds.err"
-if ! /usr/local/bin/ablab-cage-run -v /var/run/docker.sock:/var/run/docker.sock debian:bookworm-slim echo pwned >"$WORKDIR/ds.out" 2>"$dserr"; then
-  if grep -q REJECTED "$dserr"; then
-    ok "DOCKER SOCKET mount rejected"
+# --- cage allowlist bypass tests: every one of these must be REJECTED ---
+mkdir -p "${WS_ROOT}/tcage"
+ln -sfn /etc "${WS_ROOT}/tlink"
+cage_reject() {
+  local label="$1"; shift
+  if /usr/local/bin/ablab-cage-run "$@" >"$WORKDIR/cage.out" 2>"$WORKDIR/cage.err"; then
+    bad "CAGE allowed: $label"
+  elif grep -q REJECTED "$WORKDIR/cage.err"; then
+    ok "CAGE rejected: $label"
   else
-    bad "sock rejected without REJECTED"
+    bad "CAGE failed without REJECTED: $label ($(head -c 200 "$WORKDIR/cage.err"))"
   fi
-else
-  bad "wrapper allowed docker.sock"
-fi
+}
+cage_reject "docker.sock bind" -v /var/run/docker.sock:/var/run/docker.sock "$DEBIAN_IMAGE" echo pwned
+cage_reject "--privileged" --privileged "$DEBIAN_IMAGE" echo pwned
+cage_reject "--volume=/:/host" --volume=/:/host "$DEBIAN_IMAGE" echo pwned
+cage_reject "path traversal bind" -v "${WS_ROOT}/../../../../etc:/workspace" "$DEBIAN_IMAGE" echo pwned
+cage_reject "symlink bind" -v "${WS_ROOT}/tlink:/workspace" "$DEBIAN_IMAGE" echo pwned
+cage_reject "--pid host" --pid host "$DEBIAN_IMAGE" echo pwned
+cage_reject "--ipc host" --ipc host "$DEBIAN_IMAGE" echo pwned
+cage_reject "--userns host" --userns host "$DEBIAN_IMAGE" echo pwned
+cage_reject "--cap-add SYS_ADMIN" --cap-add SYS_ADMIN "$DEBIAN_IMAGE" echo pwned
+cage_reject "seccomp=unconfined" --security-opt seccomp=unconfined "$DEBIAN_IMAGE" echo pwned
+cage_reject "--memory override" --memory 64g "$DEBIAN_IMAGE" echo pwned
+cage_reject "--pids-limit override" --pids-limit -1 "$DEBIAN_IMAGE" echo pwned
+cage_reject "--network bridge" --network bridge "$DEBIAN_IMAGE" echo pwned
+cage_reject "--volumes-from" --volumes-from x "$DEBIAN_IMAGE" echo pwned
+cage_reject "--user 0" --user 0 "$DEBIAN_IMAGE" echo pwned
+cage_reject "unpinned image tag" debian:bookworm-slim echo pwned
+cage_reject "arbitrary env" -e ABL_TOKEN=x "$DEBIAN_IMAGE" echo pwned
+cage_reject "trusted rw" -v "${TRUSTED}:/trusted:rw" "$DEBIAN_IMAGE" echo pwned
+rm -rf "${WS_ROOT}/tcage" "${WS_ROOT}/tlink"
 
-if ! /usr/local/bin/ablab-cage-run --privileged debian:bookworm-slim echo pwned >"$WORKDIR/pr.out" 2>"$WORKDIR/pr.err"; then
-  if grep -q REJECTED "$WORKDIR/pr.err"; then
-    ok "PRIVILEGED rejected"
-  else
-    bad "privileged failed not REJECTED"
-  fi
+# shellcheck disable=SC2015
+if out="$(/usr/local/bin/ablab-cage-run "$IMAGE" sh -c 'id -u; cat /proc/self/status | grep -E "^(CapEff|NoNewPrivs|Seccomp):"' 2>&1)"; then
+  printf '%s' "$out" | head -1 | grep -qx 65534 && ok "CAGE runs as uid 65534" || bad "CAGE uid: $out"
+  printf '%s' "$out" | grep -q 'CapEff:[[:space:]]*0000000000000000' && ok "CAGE no effective capabilities" || bad "CAGE caps: $out"
+  printf '%s' "$out" | grep -q 'NoNewPrivs:[[:space:]]*1' && ok "CAGE no_new_privs" || bad "CAGE nnp: $out"
+  printf '%s' "$out" | grep -q 'Seccomp:[[:space:]]*2' && ok "CAGE seccomp filter active" || bad "CAGE seccomp: $out"
 else
-  bad "wrapper allowed privileged"
+  bad "CAGE introspection container failed: $out"
 fi
 
 if start_attempt child_process 6; then
@@ -374,23 +427,22 @@ else
   blocked "CHILD"
 fi
 
-if start_attempt memory 20; then
-  rc="$(jget "$RESULT" exit_status)"
-  if [ -n "$rc" ] && [ "$rc" != "0" ] && [ "$rc" != "None" ]; then
-    ok "MEMORY limit prevented unconstrained alloc (rc=$rc)"
-  else
-    bad "MEMORY worker exited 0 or rc missing (rc=$rc)"
-  fi
+if start_attempt memory 25; then
+  expect_eq "$(jget "$RESULT" oom_killed)" "True" "MEMORY worker OOM-killed by cgroup limit"
+  expect_eq "$(jget "$RESULT" timeout)" "False" "MEMORY not misclassified as timeout"
+  if grep -q "memory-unconstrained" "$EV/stdout.txt"; then bad "MEMORY allocated 4 GiB"; else ok "MEMORY never reached 4 GiB"; fi
 else
   blocked "MEMORY"
 fi
 
-if start_attempt pidbomb 20; then
-  rc="$(jget "$RESULT" exit_status)"
-  if [ -n "$rc" ] && [ "$rc" != "None" ]; then
-    ok "PID worker finished without host fork bomb (rc=$rc)"
+if start_attempt pidbomb 30; then
+  pr="$(grep -o 'PIDBOMB_RESULT {.*}' "$EV/stdout.txt" | head -1 | cut -d' ' -f2-)"
+  if [ -z "$pr" ]; then
+    err "PID worker printed no PIDBOMB_RESULT"
+  elif python3 -c 'import json,sys; d=json.loads(sys.argv[1]); sys.exit(0 if d["spawned"] < 256 and d["failed"] > 0 else 1)' "$pr"; then
+    ok "PID limit enforced ($pr)"
   else
-    err "PID missing exit_status"
+    bad "PID limit not enforced ($pr)"
   fi
 else
   blocked "PID"
@@ -413,16 +465,24 @@ else
   blocked "CRASH"
 fi
 
+TRUST_SHA_BEFORE="$(sha_tree "$FIX_TRUST")"
 if start_attempt tamper_verifier 15; then
+  expect_eq "$(jget "$EV/manifest.json" trusted_mounted)" "True" "TAMPER /trusted actually mounted into worker"
   if require_file "$EV/stdout.txt"; then
     if grep -q "tamper-ok" "$EV/stdout.txt"; then
       bad "WORKER modified trusted verifier path"
     else
       ok "WORKER cannot write trusted verifier paths"
     fi
+    if grep -q "tamper-blocked /trusted/hidden.test.mjs EROFS" "$EV/stdout.txt"; then
+      ok "TAMPER blocked by read-only mount (EROFS), not by absence"
+    else
+      bad "TAMPER not blocked by EROFS: $(grep tamper- "$EV/stdout.txt" | tr '\n' ' ')"
+    fi
   fi
-  if [ -f "${FIX_TRUST}/hidden.test.mjs" ] && grep -q "GET /health" "${FIX_TRUST}/hidden.test.mjs"; then
-    ok "trusted hidden tests unchanged"
+  expect_eq "$(jget "$RESULT" trusted_intact)" "True" "TAMPER trusted hashes unchanged (result)"
+  if [ "$(sha_tree "$FIX_TRUST")" = "$TRUST_SHA_BEFORE" ] && [ "$(sha_tree "$FIX_TRUST")" = "$(sha_tree "${ROOT}/fixtures/health-service/trusted")" ]; then
+    ok "trusted hidden tests unchanged (sha256)"
   else
     bad "trusted hidden tests altered"
   fi
@@ -466,7 +526,7 @@ else
 fi
 
 rep_ok=1
-for i in 1 2 3; do
+for _ in 1 2 3; do
   if start_attempt crash 10; then
     [ -d "${WS_ROOT}/$ATT" ] && rep_ok=0
     docker ps -aq --filter name="ablab-att-$ATT" | grep -q . && rep_ok=0
@@ -498,8 +558,7 @@ else
 fi
 rm -f "$STOP_FLAG"
 
-"$CAGE" --name ablab-att-orphan -d --rm debian:bookworm-slim sleep 60 >/dev/null 2>&1 || \
-  docker run --network none --name ablab-att-orphan --rm -d debian:bookworm-slim sleep 60 >/dev/null
+"$CAGE" --name ablab-att-orphan -d --rm "$DEBIAN_IMAGE" sleep 60 >/dev/null 2>&1 || err "could not start orphan container via cage"
 mkdir -p "${WS_ROOT}/orphan-dummy"
 /var/lib/ablab-runner/bin/ablab-reap-orphans >"$WORKDIR/reap.out"
 if docker ps -aq --filter name=ablab-att- | grep -q .; then
@@ -518,11 +577,24 @@ else
   bad "ORPHAN result"
 fi
 
-/var/lib/ablab-runner/bin/ablab-reap-orphans >"$WORKDIR/reap2.out"
-/var/lib/ablab-runner/bin/ablab-reap-orphans >"$WORKDIR/reap3.out"
-ok "IDEMPOTENT cleanup (reap twice no error)"
+if /var/lib/ablab-runner/bin/ablab-reap-orphans >"$WORKDIR/reap2.out" && /var/lib/ablab-runner/bin/ablab-reap-orphans >"$WORKDIR/reap3.out" \
+   && grep -q '"had_orphans":0' "$WORKDIR/reap3.out"; then
+  ok "IDEMPOTENT cleanup (reap twice, nothing left)"
+else
+  bad "IDEMPOTENT cleanup failed: $(cat "$WORKDIR/reap3.out" 2>/dev/null)"
+fi
 
-if /usr/local/bin/ablab-cage-run debian:bookworm-slim echo cage-ok | grep -q cage-ok; then
+# Every manifest worker has a fixture and vice versa.
+if python3 - "$WORKERS" <<'PYX'
+import json, os, sys
+w = sys.argv[1]
+ids = set(json.load(open(os.path.join(w, "manifest.json")))["workers"])
+files = {f[:-4] for f in os.listdir(w) if f.endswith(".mjs")}
+sys.exit(0 if ids == files else 1)
+PYX
+then ok "MANIFEST matches worker fixtures"; else bad "MANIFEST/worker mismatch"; fi
+
+if /usr/local/bin/ablab-cage-run "$DEBIAN_IMAGE" echo cage-ok | grep -q cage-ok; then
   ok "legal cage job still works"
 else
   bad "legal cage job broken"
