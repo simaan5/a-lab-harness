@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Evidence retention: delete attempt evidence older than ABL_EVIDENCE_DAYS (default 30)
+# and then oldest-first until total evidence is under ABL_EVIDENCE_MAX_MB (default 2048).
+# Selftest reports (HARNESS_SELFTEST_*.txt) follow the same age rule.
+set -euo pipefail
+ROOT="/var/lib/ablab-runner"
+EV="$ROOT/evidence"
+DAYS="${ABL_EVIDENCE_DAYS:-30}"
+MAXMB="${ABL_EVIDENCE_MAX_MB:-2048}"
+if ! [[ "$DAYS" =~ ^[0-9]+$ ]] || ! [[ "$MAXMB" =~ ^[0-9]+$ ]]; then echo "bad limits" >&2; exit 2; fi
+[ -d "$EV" ] || { echo '{"retention":"no_evidence_dir"}'; exit 0; }
+aged=0
+while IFS= read -r -d '' d; do
+  rm -rf -- "$d"; aged=$((aged + 1))
+done < <(find "$EV" -mindepth 1 -maxdepth 1 \( -type d -name 't*' -o -type f -name 'HARNESS_SELFTEST_*' \) -mtime "+$DAYS" -print0)
+sized=0
+while [ "$(du -sm "$EV" | cut -f1)" -gt "$MAXMB" ]; do
+  oldest="$(find "$EV" -mindepth 1 -maxdepth 1 -type d -name 't*' -printf '%T@ %p\n' | sort -n | head -1 | cut -d' ' -f2-)"
+  [ -n "$oldest" ] || break
+  rm -rf -- "$oldest"; sized=$((sized + 1))
+done
+echo "{\"retention\":\"done\",\"days\":$DAYS,\"max_mb\":$MAXMB,\"removed_by_age\":$aged,\"removed_by_size\":$sized}"

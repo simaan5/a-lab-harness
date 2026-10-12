@@ -9,16 +9,20 @@ StartLimitIntervalSec=120
 
 [Service]
 Type=simple
-EnvironmentFile=/etc/ablab/poller.env
+# No EnvironmentFile: the poller reads /etc/ablab/poller.env itself, so ABL_TOKEN never sits
+# in the process environment that children inherit.
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/var/lib/ablab-runner/bin/ablab-poller
 Restart=on-failure
 RestartSec=5
-User=root
-Group=root
+User=ablab
+Group=ablab
 WorkingDirectory=/var/lib/ablab-runner
 UMask=0077
-NoNewPrivileges=true
+# NoNewPrivileges must stay off: the poller escalates only via the sudoers rule
+# in /etc/sudoers.d/ablab-poller (four trusted helpers).
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ablab-runner
 PrivateTmp=true
 ProtectHome=true
 LockPersonality=true

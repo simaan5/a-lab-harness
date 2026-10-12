@@ -1,0 +1,8 @@
+[Unit]
+Description=AI Benchmark Lab evidence retention
+
+[Service]
+Type=oneshot
+ExecStart=/var/lib/ablab-runner/bin/ablab-retention
+User=root
+NoNewPrivileges=true

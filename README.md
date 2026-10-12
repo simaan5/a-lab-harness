@@ -2,7 +2,7 @@
 
 Dedicated host only (`hostname` must be `a-lab`).
 
-Cage: **ablab-harness 4.2 / 5.0**. Poller talks to the control plane over **HTTPS outbound only**.
+Version: see `VERSION`. Poller talks to the control plane over **HTTPS outbound only**.
 
 No Claude, Grok, Codex, or provider keys.
 
@@ -34,7 +34,7 @@ ABL_TOKEN=ablab_rt_PASTE
 ABL_PROTOCOL=ablab.runner.v1
 EOF
 sudo chmod 600 /etc/ablab/poller.env
-sudo chown root:root /etc/ablab/poller.env
+sudo chown ablab:ablab /etc/ablab/poller.env
 sudo systemctl enable --now ablab-poller
 sudo systemctl status ablab-poller --no-pager
 ```
@@ -49,3 +49,8 @@ The token is **not** a model API key.
 - put Anthropic/OpenAI/xAI keys on this machine
 - open inbound ports for the runner
 - treat fixture results as model rankings
+
+## Public repo note
+
+This repo is public. It must never contain runner tokens or real hidden tests. The fixture
+hidden test here is intentionally not secret. See `docs/RUNNER.md` → "Known, intentionally not changed".

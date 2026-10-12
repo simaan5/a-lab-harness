@@ -20,7 +20,7 @@ Installer records `/var/lib/ablab-runner/INSTALLED_COMMIT`.
 
 ## Runner stdout contract
 
-`bin/ablab-run-attempt <worker> [timeout]`
+`bin/ablab-run-attempt <worker> [timeout] [job_id]`
 
 - stdout: exactly one JSON object (last line), keys:
   - `attempt` / `attempt_id` (non-empty, filesystem-safe)
@@ -47,17 +47,71 @@ Workloads never get a host shell, `docker` CLI, or docker.sock.
 
 `docker run` without the wrapper is **not** the cage. All benchmark containers must use `ablab-cage-run`.
 
-## Cage flags (always)
+## Cage (`bin/ablab-cage-run`, allowlist)
 
-- `--network none`
-- `--cap-drop ALL`
-- `--security-opt no-new-privileges`
-- `--pids-limit 256`
-- `--memory 2g --cpus 2`
-- `--read-only` plus tmpfs `/tmp`
-- bind mounts only under `/var/lib/ablab-runner/workspaces/` → `/workspace` and `/var/lib/ablab-runner/trusted` → `/trusted:ro` (verifier)
+Accepted caller options only: `--rm`, `-d`, `--name ablab-att-*`, `-w /workspace|/trusted`,
+`-e ABL_SOCK=/sock/<name>.sock`, and these binds (host side must be a real, non-symlink,
+direct child, checked with `realpath`):
 
-Rejected: `--privileged`, host net/pid, docker.sock, arbitrary `-v`.
+| host | container |
+|---|---|
+| `/var/lib/ablab-runner/workspaces/<id>` | `/workspace[:rw|:ro]` |
+| `/var/lib/ablab-runner/trusted` | `/trusted:ro` |
+| `/var/lib/ablab-runner/run/secrets/<id>` | `/secret:ro` |
+| `/var/lib/ablab-runner/run/sock/<id>` | `/sock` |
+
+The image must appear verbatim (digest-pinned) in `config/images.lock`. Anything else is `REJECTED`.
+
+Hard flags are appended **after** caller options: `--network none --cap-drop ALL
+--security-opt no-new-privileges:true --security-opt seccomp=config/seccomp-default.json
+--user 65534:65534 --init --pids-limit 256 --memory 2g --memory-swap 2g --cpus 2
+--ulimit nofile=1024 core=0 fsize=256MiB --read-only` + noexec tmpfs `/tmp`, `/run`.
+The installer enables `userns-remap: default` and daemon-wide `no-new-privileges`.
+
+## Verifier (`bin/ablab-verify`)
+
+Worker code and test code never share a process or container:
+
+1. `vbuild`: `node --check` on a read-only copy (parses only).
+2. `vsrv`: trusted `/trusted/serve.mjs` imports the worker server and listens on a unix socket.
+3. `vvis` / `vhid`: trusted test client containers (no workspace mount) run
+   `/trusted/{visible,hidden}.test.mjs` over the socket with the TAP reporter.
+4. TAP is parsed **by test name** against `expected.json`; exit codes are never trusted.
+5. Every baseline file except `editable_files` is compared by sha256 (`protected.json`).
+6. sha256 of `/var/lib/ablab-runner/trusted` is recorded before/after every attempt.
+
+`exit_zero` is the regression worker for the old `process.exit(0)` bypass.
+
+## Classification
+
+Worker containers run detached; `docker wait` with a timeout, then `docker inspect`.
+Precedence: `cancelled` > `oom_killed` (`State.OOMKilled`) > `timeout`. Output capped at 1 MiB per stream.
+
+## Secrets and evidence
+
+Only workers with `"secret": true` in `fixtures/workers/manifest.json` get a synthetic secret,
+as the file `/secret/ABL_TEST_SECRET` (never `-e`). After each attempt every evidence file is
+redacted (plain, base64, base32, hex, URL-encoded, reversed, `ablab_rt_*`); see `redaction.meta.json`.
+`ABL_TOKEN` is never in any child environment.
+
+## Retention
+
+`ablab-retention.timer` (daily) runs `bin/ablab-retention`: evidence older than
+`ABL_EVIDENCE_DAYS` (30) is removed, then oldest-first until under `ABL_EVIDENCE_MAX_MB` (2048).
+
+## CI
+
+`.github/workflows/ci.yml`: shellcheck, ruff, `tests/` unit tests, and the full Docker selftest on
+a GitHub VM via `ABL_ALLOW_HOST=ci` (hostname override; installer skips dockerd reconfiguration, so
+userns-remap is **not** exercised in CI — only on a-lab).
+
+## Known, intentionally not changed
+
+- This repository is **public**. That is acceptable only because it contains scripted fixtures
+  and placeholders, never tokens. Consider making it private before real benchmarks exist.
+- `fixtures/health-service/trusted/hidden.test.mjs` is public, so it is **not secret**. Real
+  benchmark hidden tests must live in a private store and be mounted into `/trusted` at install time.
+- `tamper_verifier` gets `/trusted:ro` mounted on purpose so the read-only mount itself is tested.
 
 ## Lifecycle
 
@@ -66,10 +120,6 @@ ALLOCATING → PREPARING → READY → EXECUTING → COLLECTING → VERIFYING �
 ## Claim schema
 
 `ablab.claim.v1` in `.ablab/claim.json`. **Not trusted.** Verifier is authoritative.
-
-## Verifier
-
-Runs in a **separate** cage after the worker exits.
 
 ## Scripted workers (not models)
 
@@ -88,6 +138,67 @@ Local pure-data integration only. `kind: HARNESS_TEST`, `ranking_eligible: false
 ## Known limitations
 
 - Host `docker run` without the wrapper can still use the default bridge.
+- Worker definitions: `fixtures/workers/manifest.json` (single source for poller, runner, selftest).
+- Version: `VERSION` (single source).
 - No control-plane connection yet.
 - No real AI agents.
 - Fixture is a tiny Node health-endpoint, not a production app.
+
+## a-lab upgrade with userns-remap OFF (shared host)
+
+a-lab also hosts other projects' images and containers (listing-prep-studio contract images,
+postgres, a buildx builder). `userns-remap` would hide them (Docker stores remapped data under a
+separate root), so install with `ABL_USERNS_REMAP=0`. All other cage hardening still applies.
+The installer backs up and **merges** `/etc/docker/daemon.json` (existing keys kept; `icc:false` and
+`no-new-privileges:true` enforced; `userns-remap` never added in this mode, never removed) and
+restarts Docker **only** if `daemon.json` or the dockerd drop-in actually changed. With
+`live-restore: true`, running containers survive that restart.
+
+Note: daemon-wide `no-new-privileges` also applies to the other projects' containers (setuid
+helpers such as `su`/`sudo` inside them stop gaining privileges). Check them after install.
+
+### 1. Pause and back up
+```bash
+sudo systemctl stop ablab-poller || true
+sudo /var/lib/ablab-runner/bin/ablab-stop-all
+TS=$(date -u +%Y%m%dT%H%M%SZ); BK=/root/ablab-backup-$TS; sudo mkdir -p "$BK"
+sudo tar -C / -czf "$BK/ablab.tgz" --ignore-failed-read \
+  var/lib/ablab-runner/bin var/lib/ablab-runner/lib var/lib/ablab-runner/fixtures \
+  var/lib/ablab-runner/trusted var/lib/ablab-runner/schema var/lib/ablab-runner/docs \
+  var/lib/ablab-runner/INSTALLED_COMMIT var/lib/ablab-runner/INSTALLED_VERSION \
+  usr/local/bin/ablab-cage-run etc/systemd/system/ablab-poller.service \
+  etc/docker/daemon.json etc/systemd/system/docker.service.d etc/ablab/poller.env
+sudo docker ps -a --format '{{.Names}} {{.Status}}' | sudo tee "$BK/containers-before.txt"
+echo "backup: $BK"
+```
+
+### 2. Install the branch
+```bash
+cd /tmp && rm -rf a-lab-harness && git clone https://github.com/simaan5/a-lab-harness.git
+cd a-lab-harness && git checkout hardening/audit-2026-10-12 && git rev-parse HEAD
+sudo ABL_USERNS_REMAP=0 bash ./install-host.sh
+sudo docker ps -a --format '{{.Names}} {{.Status}}' | diff "$BK/containers-before.txt" - && echo "containers unchanged"
+```
+
+### 3. Selftest (expect `userns_remap=off` warning, FAIL 0 / ERROR 0)
+```bash
+sudo /var/lib/ablab-runner/bin/ablab-harness-selftest smoke && \
+sudo /var/lib/ablab-runner/bin/ablab-harness-selftest full
+sudo sh -c 'cat $(ls -t /var/lib/ablab-runner/evidence/HARNESS_READINESS_*.json | head -1)'
+```
+Leave the poller stopped until review; then `sudo systemctl enable --now ablab-poller`
+(it now runs as user `ablab`; installer already chowned `/etc/ablab/poller.env`).
+
+### 4. Roll back
+```bash
+sudo systemctl stop ablab-poller || true
+sudo /var/lib/ablab-runner/bin/ablab-stop-all || true
+sudo systemctl disable --now ablab-retention.timer 2>/dev/null || true
+sudo rm -f /etc/sudoers.d/ablab-poller /etc/systemd/system/ablab-retention.{service,timer}
+sudo cp -a /etc/docker/daemon.json /root/daemon.json.after-branch
+sudo tar -C / -xzf "$BK/ablab.tgz"
+sudo chown root:root /etc/ablab/poller.env && sudo chmod 600 /etc/ablab/poller.env
+sudo systemctl daemon-reload
+cmp -s /etc/docker/daemon.json /root/daemon.json.after-branch || sudo systemctl restart docker
+sudo /var/lib/ablab-runner/bin/ablab-harness-selftest smoke
+```

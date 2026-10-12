@@ -3,6 +3,7 @@
 # Stop the cage container and escaped fixture titles. Do NOT kill run_attempt — it must finish CLEANING.
 set -euo pipefail
 JOB="${1:?job id}"
+[[ "$JOB" =~ ^[A-Za-z0-9_-]{1,128}$ ]] || { echo "bad job id" >&2; exit 2; }
 ROOT="/var/lib/ablab-runner"
 mkdir -p "$ROOT/run/active"
 date -u +%Y-%m-%dT%H:%M:%SZ >"$ROOT/run/cancel-job-${JOB}"
@@ -16,8 +17,8 @@ fi
 if [ -n "$ATT" ]; then
   date -u +%Y-%m-%dT%H:%M:%SZ >"$ROOT/run/cancel-${ATT}"
 fi
-if [ -n "$NAME" ]; then
-  docker rm -f "$NAME" "${NAME}-vbuild" "${NAME}-vvis" "${NAME}-vhid" >/dev/null 2>&1 || true
+if [ -n "$NAME" ] && [[ "$NAME" =~ ^ablab-att-t[0-9a-zA-Z]+$ ]]; then
+  docker rm -f "$NAME" "${NAME}-vbuild" "${NAME}-vsrv" "${NAME}-vvis" "${NAME}-vhid" >/dev/null 2>&1 || true
 fi
 # Unique fixture process titles — only if they escaped onto the host.
 pkill -f 'ablab-cancel-parent' >/dev/null 2>&1 || true

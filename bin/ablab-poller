@@ -17,27 +17,32 @@ from pathlib import Path
 ROOT = Path("/var/lib/ablab-runner")
 ENVF = Path("/etc/ablab/poller.env")
 STOP_FLAG = ROOT / "run" / "STOP_ALL"
-ALLOWED = {
-    "good",
-    "noop",
-    "test_fail",
-    "build_fail",
-    "false_claim",
-    "delete_test",
-    "modify_protected",
-    "hardcode",
-    "secret_leak",
-    "network",
-    "host_read",
-    "host_write",
-    "child_process",
-    "timeout",
-    "crash",
-    "bad_claim",
-    "memory",
-    "pidbomb",
-    "tamper_verifier",
-}
+MANIFEST = ROOT / "fixtures" / "workers" / "manifest.json"
+PRIV_BIN = ROOT / "bin"
+# Variables that must never reach attempts/containers.
+SCRUB_ENV = ("ABL_TOKEN", "ABL_BASE_URL", "ABL_PROTOCOL")
+
+
+def load_workers() -> dict[str, dict]:
+    try:
+        data = json.loads(MANIFEST.read_text())
+        workers = data["workers"]
+        return {k: v for k, v in workers.items() if isinstance(v, dict)}
+    except Exception as e:  # noqa: BLE001
+        print(f"cannot read worker manifest {MANIFEST}: {e}", file=sys.stderr)
+        raise SystemExit(1) from e
+
+
+def read_version() -> str:
+    for p in (ROOT / "VERSION", Path(__file__).resolve().parent.parent / "VERSION"):
+        if p.is_file():
+            return p.read_text().strip()
+    return "unknown"
+
+
+WORKERS: dict[str, dict] = {}
+ALLOWED: set[str] = set()
+VERSION = read_version()
 PROTOCOL = "ablab.runner.v1"
 
 
@@ -108,7 +113,7 @@ def api(base: str, token: str, path: str, payload: dict | None = None, method: s
             "Authorization": "Bearer " + token,
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": "curl/8.5.0",
+            "User-Agent": f"ablab-poller/{VERSION} (+https://github.com/simaan5/a-lab-harness)",
         },
     )
     try:
@@ -148,15 +153,27 @@ def identity(busy: bool) -> dict:
         "os": f"{platform.system()} {platform.release()}",
         "arch": platform.machine(),
         "cpu": sh(["nproc"]),
-        "runner_software_version": "ablab-poller 5.5",
+        "runner_software_version": f"ablab-poller {VERSION}",
         "harness_version": ver,
         "harness_commit": commit,
-        "docker_version": sh(["docker", "version", "--format", "{{.Server.Version}}"]),
+        "docker_version": (ROOT / "DOCKER_VERSION").read_text().strip() if (ROOT / "DOCKER_VERSION").is_file() else "unknown",
         "cage_path": "/usr/local/bin/ablab-cage-run",
         "supported_fixtures": sorted(ALLOWED),
         "busy": busy,
         "agents": "not_integrated",
     }
+
+
+def child_env() -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k not in SCRUB_ENV}
+    return env
+
+
+def priv(argv: list[str]) -> list[str]:
+    """Privileged helpers run via a narrow sudoers rule when the poller is not root."""
+    if os.geteuid() == 0:
+        return argv
+    return ["sudo", "-n", "--"] + argv
 
 
 def load_json(path: Path) -> dict:
@@ -171,14 +188,12 @@ def load_json(path: Path) -> dict:
 
 def supervise_attempt(base: str, token: str, job_id: str, worker: str, timeout: int) -> dict:
     """Run attempt without blocking heartbeat. Cancel uses trusted local tool only."""
-    env = os.environ.copy()
-    env["ABL_JOB_ID"] = job_id
     proc = subprocess.Popen(
-        [str(ROOT / "bin" / "ablab-run-attempt"), worker, str(timeout)],
+        priv([str(PRIV_BIN / "ablab-run-attempt"), worker, str(timeout), job_id]),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        env=env,
+        env=child_env(),
         start_new_session=True,
     )
     cancel_observed_at: str | None = None
@@ -189,7 +204,7 @@ def supervise_attempt(base: str, token: str, job_id: str, worker: str, timeout: 
             if cancel_observed_at is None:
                 cancel_observed_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 log(f"cancel observed job={job_id} at={cancel_observed_at}")
-            subprocess.run([str(ROOT / "bin" / "ablab-cancel-attempt"), job_id], check=False)
+            subprocess.run(priv([str(PRIV_BIN / "ablab-cancel-attempt"), job_id]), check=False, env=child_env())
         time.sleep(2)
     stdout, stderr = proc.communicate()
     lines = (stdout or "").strip().splitlines()
@@ -210,6 +225,7 @@ def supervise_attempt(base: str, token: str, job_id: str, worker: str, timeout: 
         }
     result["kind"] = "HARNESS_TEST"
     result["model"] = None
+    result["ranking_eligible"] = False
     if cancel_observed_at:
         result["cancelled"] = True
         result["timeout"] = False
@@ -222,7 +238,8 @@ def supervise_attempt(base: str, token: str, job_id: str, worker: str, timeout: 
 
 def post_artifacts(base: str, token: str, job_id: str, result: dict) -> None:
     evid = Path(str(result.pop("_evidence_dir", "") or ""))
-    api(base, token, "/api/runner/events", {"job_id": job_id, "seq": 2, "kind": "COLLECTED", "payload": {"attempt": result.get("attempt_id")}})
+    api(base, token, "/api/runner/events",
+        {"job_id": job_id, "seq": 2, "kind": "COLLECTED", "payload": {"attempt": result.get("attempt_id")}})
     stdout = ""
     if evid.is_dir():
         stdout_path = evid / "stdout.txt"
@@ -252,6 +269,9 @@ def post_artifacts(base: str, token: str, job_id: str, result: dict) -> None:
 def main() -> None:
     if socket.gethostname() != "a-lab":
         die(f"refusing to run on {socket.gethostname()}; expected a-lab")
+    global WORKERS, ALLOWED
+    WORKERS = load_workers()
+    ALLOWED = set(WORKERS)
     env = load_env()
     base = env.get("ABL_BASE_URL", "").rstrip("/")
     token = env.get("ABL_TOKEN", "")
@@ -261,7 +281,7 @@ def main() -> None:
         die("BLOCKED \u2014 STABLE HTTPS CONTROL-PLANE ENDPOINT REQUIRED")
     if token.startswith("sk-") or "anthropic" in token.lower() or "openai" in token.lower():
         die("Refusing provider/model API keys in poller.env")
-    log("ablab-poller 5.5 starting. Agents are not integrated.")
+    log(f"ablab-poller {VERSION} starting. Agents are not integrated.")
     log(f"base={base}")
     busy = False
     last_hb_log = 0.0
@@ -269,7 +289,7 @@ def main() -> None:
         if STOP_FLAG.is_file() and not busy:
             code, hb = api(base, token, "/api/runner/heartbeat", identity(True))
             if code == 200 and hb.get("resume"):
-                STOP_FLAG.unlink(missing_ok=True)
+                subprocess.run(priv([str(PRIV_BIN / "ablab-resume")]), check=False, env=child_env())
                 api(base, token, "/api/runner/cleanup", {"kind": "resume"})
                 log("resume observed; local STOP_ALL cleared")
                 time.sleep(1)
@@ -295,7 +315,7 @@ def main() -> None:
             time.sleep(5)
             continue
         if hb.get("stop_all"):
-            subprocess.run([str(ROOT / "bin" / "ablab-stop-all")], check=False)
+            subprocess.run(priv([str(PRIV_BIN / "ablab-stop-all")]), check=False, env=child_env())
             api(base, token, "/api/runner/cleanup", {"kind": "stop_all"})
             busy = False
             time.sleep(2)
@@ -314,18 +334,16 @@ def main() -> None:
         worker = str(job.get("worker_id") or "")
         log(f"claimed {job_id} worker={worker}")
         if worker not in ALLOWED or job.get("kind") != "HARNESS_TEST":
-            api(base, token, "/api/runner/complete", {"job_id": job_id, "result": {"kind": "HARNESS_TEST", "model": None}, "error": "unknown_fixture"})
+            api(base, token, "/api/runner/complete",
+                {"job_id": job_id, "result": {"kind": "HARNESS_TEST", "model": None}, "error": "unknown_fixture"})
             continue
         if job_id in cancels:
-            api(base, token, "/api/runner/complete", {"job_id": job_id, "result": {"kind": "HARNESS_TEST", "model": None, "cancelled": True}})
+            api(base, token, "/api/runner/complete",
+                {"job_id": job_id, "result": {"kind": "HARNESS_TEST", "model": None, "cancelled": True}})
             continue
         busy = True
         api(base, token, "/api/runner/events", {"job_id": job_id, "seq": 1, "kind": "CLAIMED", "payload": {"worker": worker}})
-        timeout = 30 if worker != "timeout" else 8
-        if worker == "memory":
-            timeout = 25
-        if worker == "child_process":
-            timeout = 90
+        timeout = int(WORKERS[worker].get("timeout", 30))
         result = supervise_attempt(base, token, job_id, worker, timeout)
         log(f"attempt done job={job_id} status={result.get('status')!r} cancelled={result.get('cancelled')!r}")
         post_artifacts(base, token, job_id, result)
@@ -337,4 +355,4 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        raise SystemExit(0)
+        raise SystemExit(0) from None

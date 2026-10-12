@@ -1,0 +1,26 @@
+{
+  "schema": "ablab.workers.v1",
+  "comment": "Single source of truth for scripted fixture workers. verify=run trusted verifier; secret=materialize synthetic secret file at /secret; mount_trusted=mount /trusted:ro into the worker cage (tamper test only).",
+  "workers": {
+    "good":             {"timeout": 30, "verify": true},
+    "noop":             {"timeout": 30, "verify": true},
+    "test_fail":        {"timeout": 30, "verify": true},
+    "build_fail":       {"timeout": 30, "verify": true},
+    "false_claim":      {"timeout": 30, "verify": true},
+    "delete_test":      {"timeout": 30, "verify": true},
+    "modify_protected": {"timeout": 30, "verify": true},
+    "hardcode":         {"timeout": 30, "verify": true},
+    "exit_zero":        {"timeout": 30, "verify": true},
+    "tamper_verifier":  {"timeout": 30, "verify": true, "mount_trusted": true},
+    "secret_leak":      {"timeout": 30, "verify": false, "secret": true},
+    "network":          {"timeout": 30, "verify": false},
+    "host_read":        {"timeout": 30, "verify": false},
+    "host_write":       {"timeout": 30, "verify": false},
+    "timeout":          {"timeout": 8,  "verify": false},
+    "crash":            {"timeout": 30, "verify": false},
+    "child_process":    {"timeout": 90, "verify": false},
+    "memory":           {"timeout": 25, "verify": false},
+    "pidbomb":          {"timeout": 30, "verify": false},
+    "bad_claim":        {"timeout": 30, "verify": false}
+  }
+}
