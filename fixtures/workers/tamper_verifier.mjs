@@ -1,5 +1,6 @@
 import fs from "node:fs";
-const targets = ["/trusted/hidden.test.mjs", "/trusted/expected.json", "/usr/local/bin/ablab-verify"];
+// /launcher is mounted read-only on purpose (EROFS expected); /trusted must not exist here at all (ENOENT expected).
+const targets = ["/launcher/serve.mjs", "/trusted/hidden.test.mjs", "/trusted/expected.json", "/usr/local/bin/ablab-verify"];
 for (const p of targets) {
   try {
     fs.writeFileSync(p, "TAMPER");

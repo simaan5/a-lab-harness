@@ -1,6 +1,6 @@
 {
   "schema": "ablab.workers.v1",
-  "comment": "Single source of truth for scripted fixture workers. verify=run trusted verifier; secret=materialize synthetic secret file at /secret; mount_trusted=mount /trusted:ro into the worker cage (tamper test only).",
+  "comment": "Single source of truth for scripted fixture workers. verify=run trusted verifier; secret=materialize synthetic secret file at /secret; mount_launcher=mount /launcher:ro (serve.mjs only) into the worker cage (tamper test only). /trusted (hidden tests) is never mounted into a worker cage.",
   "workers": {
     "good":             {"timeout": 30, "verify": true},
     "noop":             {"timeout": 30, "verify": true},
@@ -11,7 +11,7 @@
     "modify_protected": {"timeout": 30, "verify": true},
     "hardcode":         {"timeout": 30, "verify": true},
     "exit_zero":        {"timeout": 30, "verify": true},
-    "tamper_verifier":  {"timeout": 30, "verify": true, "mount_trusted": true},
+    "tamper_verifier":  {"timeout": 30, "verify": true, "mount_launcher": true},
     "secret_leak":      {"timeout": 30, "verify": false, "secret": true},
     "network":          {"timeout": 30, "verify": false},
     "host_read":        {"timeout": 30, "verify": false},

@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Trusted verifier. Worker code and test code never share a process or container:
 #   vbuild : node --check on a read-only copy (parse only, never executes worker code)
-#   vsrv   : worker server launched by trusted /trusted/serve.mjs on a unix socket
+#   vsrv   : worker server launched by trusted /launcher/serve.mjs on a unix socket
 #   vvis/vhid : trusted test client (no workspace mount) talks to the socket; TAP parsed by name
-# Protected files are checked by sha256 against the trusted baseline.
+# Hidden tests (/trusted) are mounted only into vvis/vhid, never into a container that runs
+# or holds worker code. Protected files are checked by sha256 against the trusted baseline.
+# A workspace containing anything but regular files and directories is rejected before it is
+# copied or read. Every container step has a hard timeout; ablab-run-attempt bounds the whole run.
 set -euo pipefail
 . /var/lib/ablab-runner/lib/common.sh
 ATT="${1:?attempt id}"
@@ -15,13 +18,21 @@ SOCK="${SOCK_ROOT}/${ATT}"
 NAME="ablab-att-${ATT}"
 mkdir -p "$EV"
 rm -rf "$VWS" "$SOCK"
+
+python3 "$PY" protected-check "$FIX_BASE" "$WS" "$FIX_TRUST/expected.json" "$EV/protected.json"
+if ! python3 "$PY" special-gate "$EV/protected.json" "$EV/verified.json"; then
+  echo "REJECTED: non-regular files in worker output; verifier not run" >&2
+  echo "$EV/verified.json"
+  exit 0
+fi
+
 mkdir -p "$VWS" "$SOCK"
 cp -a "$WS"/. "$VWS"/
 chown_for_cage "$VWS" "$SOCK"
 chmod 0700 "$SOCK"
 
 trusted_before="$(sha_tree "$FIX_TRUST")"
-python3 "$PY" protected-check "$FIX_BASE" "$WS" "$FIX_TRUST/expected.json" "$EV/protected.json"
+launcher_before="$(sha_tree "$LAUNCHER")"
 vis_missing=0
 [ -f "$WS/test/visible.test.mjs" ] || vis_missing=1
 
@@ -41,30 +52,36 @@ trap cleanup EXIT
 if stop_all_requested; then
   echo "STOP ALL — skipping verifier exec" | tee "$build_log"
 else
-  "$CAGE" --name "${NAME}-vbuild" -v "${VWS}:/workspace:ro" -w /workspace --rm \
+  timeout -k 5 "$VERIFY_STEP_TIMEOUT_SECS" "$CAGE" --name "${NAME}-vbuild" -v "${VWS}:/workspace:ro" -w /workspace --rm \
     "$IMAGE" node --check src/server.mjs >"$build_log" 2>&1 && build_rc=0 || build_rc=$?
+  if [ "$build_rc" -eq 124 ] || [ "$build_rc" -eq 137 ]; then
+    echo "[ablab: build check timed out after ${VERIFY_STEP_TIMEOUT_SECS}s]" >>"$build_log"
+    docker rm -f "${NAME}-vbuild" >/dev/null 2>&1 || true
+  fi
 
-  "$CAGE" --name "${NAME}-vsrv" -d -v "${VWS}:/workspace:ro" -v "${TRUSTED}:/trusted:ro" \
+  # Worker code runs here: launcher only, no /trusted.
+  timeout -k 5 "$VERIFY_STEP_TIMEOUT_SECS" "$CAGE" --name "${NAME}-vsrv" -d -v "${VWS}:/workspace:ro" -v "${LAUNCHER}:/launcher:ro" \
     -v "${SOCK}:/sock:rw" -e ABL_SOCK=/sock/app.sock -w /workspace \
-    "$IMAGE" node /trusted/serve.mjs >/dev/null 2>&1 || true
+    "$IMAGE" node /launcher/serve.mjs >/dev/null 2>&1 || true
 
-  timeout 60 "$CAGE" --name "${NAME}-vvis" --rm -v "${TRUSTED}:/trusted:ro" -v "${SOCK}:/sock:rw" \
+  timeout -k 5 "$VERIFY_TEST_TIMEOUT_SECS" "$CAGE" --name "${NAME}-vvis" --rm -v "${TRUSTED}:/trusted:ro" -v "${SOCK}:/sock:rw" \
     -e ABL_SOCK=/sock/app.sock -w /trusted \
     "$IMAGE" node --test-reporter=tap /trusted/visible.test.mjs >"$vis_log" 2>&1 || true
-  timeout 60 "$CAGE" --name "${NAME}-vhid" --rm -v "${TRUSTED}:/trusted:ro" -v "${SOCK}:/sock:rw" \
+  timeout -k 5 "$VERIFY_TEST_TIMEOUT_SECS" "$CAGE" --name "${NAME}-vhid" --rm -v "${TRUSTED}:/trusted:ro" -v "${SOCK}:/sock:rw" \
     -e ABL_SOCK=/sock/app.sock -w /trusted \
     "$IMAGE" node --test-reporter=tap /trusted/hidden.test.mjs >"$hid_log" 2>&1 || true
-  docker logs "${NAME}-vsrv" 2>&1 | head -c 65536 >"$srv_log" || true
+  timeout -k 5 "$VERIFY_STEP_TIMEOUT_SECS" docker logs "${NAME}-vsrv" 2>&1 | head -c 65536 >"$srv_log" || true
 fi
 cleanup
 
 python3 "$PY" parse-tap "$vis_log" "$EV/.exp-vis.json" "$EV/verify-visible.json"
 python3 "$PY" parse-tap "$hid_log" "$EV/.exp-hid.json" "$EV/verify-hidden.json"
 trusted_after="$(sha_tree "$FIX_TRUST")"
+launcher_after="$(sha_tree "$LAUNCHER")"
 
-python3 - "$EV" "$build_rc" "$vis_missing" "$trusted_before" "$trusted_after" <<'PY'
+python3 - "$EV" "$build_rc" "$vis_missing" "$trusted_before" "$trusted_after" "$launcher_before" "$launcher_after" <<'PY'
 import json, os, sys
-ev, build_rc, vis_missing, tb, ta = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], sys.argv[5]
+ev, build_rc, vis_missing, tb, ta, lb, la = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7]
 load = lambda n: json.load(open(os.path.join(ev, n)))
 prot = load("protected.json")
 vis = load("verify-visible.json")
@@ -72,7 +89,7 @@ hid = load("verify-hidden.json")
 build_passed = build_rc == 0
 visible_passed = vis["passed"] and not vis_missing
 hidden_passed = hid["passed"]
-trusted_intact = tb == ta
+trusted_intact = tb == ta and lb == la
 doc = {
   "build_passed": build_passed,
   "visible_passed": visible_passed,
@@ -87,6 +104,8 @@ doc = {
   "build_rc": build_rc,
   "trusted_sha_before": tb,
   "trusted_sha_after": ta,
+  "launcher_sha_before": lb,
+  "launcher_sha_after": la,
   "trusted_intact": trusted_intact,
   "method": "tap-by-name/black-box-socket/v2",
 }

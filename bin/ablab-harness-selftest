@@ -169,7 +169,7 @@ note "WORKDIR=$WORKDIR"
 USERNS="$(userns_mode)"
 note "userns_remap=$USERNS"
 if [ "$USERNS" = "off" ]; then
-  note "WARNING: userns_remap=off — container uid 65534 maps to host uid 65534 (ABL_USERNS_REMAP=0 install). Other cage hardening still enforced."
+  note "WARNING: userns_remap=off — container uid 65534 maps to host uid 65534 (installer default; opt in with ABL_USERNS_REMAP=1). Other cage hardening still enforced."
 fi
 note "=================================================="
 
@@ -417,6 +417,8 @@ cage_reject "--user 0" --user 0 "$DEBIAN_IMAGE" echo pwned
 cage_reject "unpinned image tag" debian:bookworm-slim echo pwned
 cage_reject "arbitrary env" -e ABL_TOKEN=x "$DEBIAN_IMAGE" echo pwned
 cage_reject "trusted rw" -v "${TRUSTED}:/trusted:rw" "$DEBIAN_IMAGE" echo pwned
+cage_reject "launcher rw" -v "${LAUNCHER}:/launcher:rw" "$DEBIAN_IMAGE" echo pwned
+cage_reject "hidden tests next to workspace" -v "${WS_ROOT}/tcage:/workspace:ro" -v "${TRUSTED}:/trusted:ro" "$DEBIAN_IMAGE" echo pwned
 rm -rf "${WS_ROOT}/tcage" "${WS_ROOT}/tlink"
 
 # shellcheck disable=SC2015
@@ -485,21 +487,28 @@ fi
 
 TRUST_SHA_BEFORE="$(sha_tree "$FIX_TRUST")"
 if start_attempt tamper_verifier 15; then
-  expect_eq "$(jget "$EV/manifest.json" trusted_mounted)" "True" "TAMPER /trusted actually mounted into worker"
+  expect_eq "$(jget "$EV/manifest.json" launcher_mounted)" "True" "TAMPER /launcher actually mounted into worker"
+  expect_eq "$(jget "$EV/manifest.json" trusted_mounted)" "False" "TAMPER hidden tests (/trusted) not mounted into worker"
   if require_file "$EV/stdout.txt"; then
     if grep -q "tamper-ok" "$EV/stdout.txt"; then
       bad "WORKER modified trusted verifier path"
     else
       ok "WORKER cannot write trusted verifier paths"
     fi
-    if grep -q "tamper-blocked /trusted/hidden.test.mjs EROFS" "$EV/stdout.txt"; then
+    if grep -q "tamper-blocked /launcher/serve.mjs EROFS" "$EV/stdout.txt"; then
       ok "TAMPER blocked by read-only mount (EROFS), not by absence"
     else
       bad "TAMPER not blocked by EROFS: $(grep tamper- "$EV/stdout.txt" | tr '\n' ' ')"
     fi
+    if grep -q "tamper-blocked /trusted/hidden.test.mjs ENOENT" "$EV/stdout.txt"; then
+      ok "HIDDEN tests absent from worker container (ENOENT)"
+    else
+      bad "HIDDEN tests visible to worker: $(grep tamper- "$EV/stdout.txt" | tr '\n' ' ')"
+    fi
   fi
   expect_eq "$(jget "$RESULT" trusted_intact)" "True" "TAMPER trusted hashes unchanged (result)"
-  if [ "$(sha_tree "$FIX_TRUST")" = "$TRUST_SHA_BEFORE" ] && [ "$(sha_tree "$FIX_TRUST")" = "$(sha_tree "${ROOT}/fixtures/health-service/trusted")" ]; then
+  if [ "$(sha_tree "$FIX_TRUST")" = "$TRUST_SHA_BEFORE" ] && [ "$(sha_tree "$FIX_TRUST")" = "$(sha_tree "${ROOT}/fixtures/health-service/trusted")" ] \
+     && [ "$(sha_tree "$LAUNCHER")" = "$(sha_tree "${ROOT}/fixtures/health-service/launcher")" ]; then
     ok "trusted hidden tests unchanged (sha256)"
   else
     bad "trusted hidden tests altered"

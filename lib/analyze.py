@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import urllib.parse
 from typing import Any
@@ -176,6 +177,26 @@ def file_hashes(root: str) -> dict[str, str]:
     return out
 
 
+def special_files(root: str) -> list[dict]:
+    """Every entry under root that is neither a regular file nor a real directory
+    (symlink, fifo, socket, device). Uses lstat only: nothing is opened or followed."""
+    out = []
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        with os.scandir(d) as it:
+            entries = sorted(it, key=lambda e: e.name)
+        for e in entries:
+            mode = e.stat(follow_symlinks=False).st_mode
+            if stat.S_ISDIR(mode):
+                stack.append(e.path)
+            elif not stat.S_ISREG(mode):
+                kind = ("symlink" if stat.S_ISLNK(mode) else "fifo" if stat.S_ISFIFO(mode) else "socket" if stat.S_ISSOCK(mode)
+                        else "device" if stat.S_ISCHR(mode) or stat.S_ISBLK(mode) else "other")
+                out.append({"path": os.path.relpath(e.path, root), "type": kind})
+    return sorted(out, key=lambda x: x["path"])
+
+
 def sha_tree(root: str) -> str:
     h = hashlib.sha256()
     for rel, digest in sorted(file_hashes(root).items()):
@@ -185,7 +206,9 @@ def sha_tree(root: str) -> str:
 
 def protected_check(base: str, ws: str, editable: list[str]) -> dict:
     """Every baseline file except `editable` must be byte-identical (sha256) in the workspace.
-    New files are allowed only under .ablab/ or src/; nothing may appear under test/."""
+    New files are allowed only under .ablab/ or src/; nothing may appear under test/.
+    Anything that is not a regular file or a real directory fails the check."""
+    special = special_files(ws)
     b = file_hashes(base)
     w = file_hashes(ws)
     modified, missing, added = [], [], []
@@ -208,10 +231,28 @@ def protected_check(base: str, ws: str, editable: list[str]) -> dict:
         else:
             added.append(rel)
     return {
-        "protected_ok": not (modified or missing or added),
+        "protected_ok": not (modified or missing or added or special),
         "modified": sorted(modified),
         "missing": sorted(missing),
         "unexpected_added": sorted(added),
+        "special_files": special,
+    }
+
+
+def special_gate(prot: dict) -> dict | None:
+    """verified.json for a workspace the verifier must not read (non-regular files), else None."""
+    if not prot.get("special_files"):
+        return None
+    return {
+        "build_passed": False,
+        "visible_passed": False,
+        "hidden_passed": False,
+        "tests_passed": False,
+        "task_complete": False,
+        "protected_ok": False,
+        "protected": prot,
+        "rejected": "special_files",
+        "method": "tap-by-name/black-box-socket/v2",
     }
 
 
@@ -346,6 +387,12 @@ def main(argv: list[str]) -> int:
         editable = load_json(argv[4]).get("editable_files", [])
         write_json(argv[5], protected_check(argv[2], argv[3], editable))
         return 0
+    if cmd == "special-gate":
+        doc = special_gate(load_json(argv[2]))
+        if doc is None:
+            return 0
+        write_json(argv[3], doc)
+        return 4
     if cmd == "parse-tap":
         write_json(argv[4], parse_tap(argv[2], load_json(argv[3])))
         return 0
@@ -375,7 +422,8 @@ def main(argv: list[str]) -> int:
         out = {"false_completion": fc, "score": sc}
         write_json(argv[6], out)
         return 0
-    print("usage: analyze.py parse-claim|redact|redact-dir|sha|sha-tree|protected-check|parse-tap|worker-field|workers|fairness|finalize ...", file=sys.stderr)
+    print("usage: analyze.py parse-claim|redact|redact-dir|sha|sha-tree|protected-check|special-gate|parse-tap|"
+          "worker-field|workers|fairness|finalize ...", file=sys.stderr)
     return 2
 
 

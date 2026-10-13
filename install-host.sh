@@ -3,12 +3,12 @@
 #   sudo bash ./install-host.sh
 # CI only (never on a-lab):  sudo ABL_ALLOW_HOST=ci bash ./install-host.sh
 #   -> skips the hostname check and leaves the CI runner's dockerd config alone.
-# a-lab with other projects' containers:  sudo ABL_USERNS_REMAP=0 bash ./install-host.sh
+# userns-remap is OFF by default. Opt in (dedicated Docker host only):  sudo ABL_USERNS_REMAP=1 bash ./install-host.sh
 set -euo pipefail
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "Re-running as root: sudo bash $0 $*" >&2
-  exec sudo ABL_ALLOW_HOST="${ABL_ALLOW_HOST:-}" ABL_USERNS_REMAP="${ABL_USERNS_REMAP:-1}" bash "$0" "$@"
+  exec sudo ABL_ALLOW_HOST="${ABL_ALLOW_HOST:-}" ABL_USERNS_REMAP="${ABL_USERNS_REMAP:-0}" bash "$0" "$@"
 fi
 
 CI_MODE=0
@@ -26,7 +26,8 @@ VERSION="$(cat "$SRC/VERSION")"
 
 for f in bin/ablab-run-attempt bin/ablab-harness-selftest bin/ablab-cage-run bin/ablab-verify bin/ablab-poller \
          lib/analyze.py lib/common.sh lib/daemon_config.py config/images.lock config/seccomp-default.json \
-         fixtures/workers/manifest.json fixtures/health-service/baseline/src/server.mjs; do
+         fixtures/workers/manifest.json fixtures/health-service/baseline/src/server.mjs \
+         fixtures/health-service/launcher/serve.mjs; do
   [ -e "$SRC/$f" ] || { echo "INSTALL FAIL: missing $f" >&2; exit 1; }
 done
 python3 - "$SRC" <<'PY'
@@ -45,11 +46,11 @@ if command -v apt-get >/dev/null 2>&1 && [ "${ABL_SKIP_APT:-0}" != "1" ]; then
   DEBIAN_FRONTEND=noninteractive apt-get install -y python3 openssl ca-certificates sudo
 fi
 
-# ABL_USERNS_REMAP=1 (default) adds "userns-remap": "default".
-# ABL_USERNS_REMAP=0 leaves remapping off (a-lab also hosts other projects' images/containers,
-# which remapping would hide). Either way daemon.json is backed up and MERGED, never overwritten,
+# ABL_USERNS_REMAP=0 (default) leaves remapping off (a-lab also hosts other projects' images/containers,
+# which remapping would hide). ABL_USERNS_REMAP=1 opts in and adds "userns-remap": "default".
+# Either way daemon.json is backed up and MERGED, never overwritten,
 # and Docker restarts only if daemon.json or the drop-in actually changed.
-USERNS_REMAP="${ABL_USERNS_REMAP:-1}"
+USERNS_REMAP="${ABL_USERNS_REMAP:-0}"
 case "$USERNS_REMAP" in 0|1) ;; *) echo "ABL_USERNS_REMAP must be 0 or 1" >&2; exit 1 ;; esac
 if [ "$CI_MODE" -eq 0 ]; then
   mkdir -p /etc/docker
@@ -81,7 +82,7 @@ if [ "$CI_MODE" -eq 0 ]; then
     echo "Docker NOT restarted (no configuration change)"
   fi
   if [ "$USERNS_REMAP" = "0" ]; then
-    echo "WARNING: userns-remap OFF — container uid 65534 is host uid 65534. Other hardening stays on."
+    echo "WARNING: userns-remap not requested (default) — container uid 65534 is host uid 65534. Other hardening stays on. Opt in with ABL_USERNS_REMAP=1."
   fi
 fi
 docker info >/dev/null
@@ -96,6 +97,9 @@ cp -a "$SRC/bin" "$SRC/lib" "$SRC/schema" "$SRC/docs" "$SRC/fixtures" "$SRC/conf
 cp -a "$SRC/VERSION" "$ROOT/VERSION"
 rm -rf "$ROOT/trusted"; mkdir -p "$ROOT/trusted"
 cp -a "$ROOT/fixtures/health-service/trusted/." "$ROOT/trusted/"
+# Launcher (serve.mjs only) is the one trusted dir mounted next to worker code; tests stay in trusted/.
+rm -rf "$ROOT/launcher"; mkdir -p "$ROOT/launcher"
+cp -a "$ROOT/fixtures/health-service/launcher/." "$ROOT/launcher/"
 install -m 0755 "$ROOT/bin/ablab-cage-run" /usr/local/bin/ablab-cage-run
 sed -i 's/\r$//' "$ROOT/bin/"* "$ROOT/lib/common.sh" "$ROOT/lib/analyze.py" || true
 chown -R root:root "$ROOT"
@@ -103,8 +107,8 @@ chmod 0755 "$ROOT" "$ROOT/bin/"* "$ROOT/lib/analyze.py"
 chmod 0644 "$ROOT/lib/common.sh"
 chmod 0711 "$ROOT/workspaces" "$ROOT/run/secrets" "$ROOT/run/sock"
 chmod 0750 "$ROOT/evidence" && chgrp ablab "$ROOT/evidence"
-chmod 0755 "$ROOT/run" "$ROOT/trusted"
-find "$ROOT/trusted" -type f -exec chmod 0644 {} +
+chmod 0755 "$ROOT/run" "$ROOT/trusted" "$ROOT/launcher"
+find "$ROOT/trusted" "$ROOT/launcher" -type f -exec chmod 0644 {} +
 
 if [ ! -f /etc/ablab/HOST_CANARY.txt ]; then
   echo "HOST_SECRET_CANARY_DO_NOT_LEAK" >/etc/ablab/HOST_CANARY.txt

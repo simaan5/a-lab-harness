@@ -32,6 +32,8 @@ check_volume() {
       child_of "${ROOT}/workspaces" "$src" ;;
     /trusted)
       [ "$mode" = "ro" ] && [ "$src" = "${ROOT}/trusted" ] && [ ! -L "$src" ] ;;
+    /launcher)
+      [ "$mode" = "ro" ] && [ "$src" = "${ROOT}/launcher" ] && [ ! -L "$src" ] ;;
     /secret)
       [ "$mode" = "ro" ] && child_of "${ROOT}/run/secrets" "$src" ;;
     /sock)
@@ -48,6 +50,8 @@ image_allowed() {
 
 opts=()
 image=""
+has_ws=0
+has_trusted=0
 while [ "$#" -gt 0 ]; do
   a="$1"
   case "$a" in
@@ -67,12 +71,18 @@ while [ "$#" -gt 0 ]; do
     -v)
       [ "$#" -ge 2 ] || reject "-v needs a value"
       check_volume "$2" || reject "bind $2 is forbidden in the cage"
+      case "$2" in
+        *:/workspace|*:/workspace:*) has_ws=1 ;;
+        *:/trusted:*) has_trusted=1 ;;
+      esac
       opts+=(-v "$2"); shift 2 ;;
     -*) reject "$a is not on the cage allowlist" ;;
     *) image="$a"; shift; break ;;
   esac
 done
 [ -n "$image" ] || reject "no image given"
+# Hidden tests (/trusted) never share a container with worker code (/workspace).
+[ "$has_ws" -eq 0 ] || [ "$has_trusted" -eq 0 ] || reject "/trusted cannot be combined with /workspace"
 image_allowed "$image" || reject "image $image is not digest-pinned in $LOCK"
 [ -f "$SECCOMP" ] || reject "seccomp profile $SECCOMP missing"
 

@@ -39,6 +39,7 @@ Empty stdout, malformed JSON, or empty attempt id is a **harness error**.
 |---|---|
 | `/var/lib/ablab-runner/fixtures` | operators only |
 | `/var/lib/ablab-runner/trusted` | operators only |
+| `/var/lib/ablab-runner/launcher` | operators only |
 | `/var/lib/ablab-runner/bin` | operators only |
 | `/var/lib/ablab-runner/workspaces/<id>` | one attempt, then destroyed |
 | `/etc/ablab/HOST_CANARY.txt` | host only |
@@ -56,7 +57,8 @@ direct child, checked with `realpath`):
 | host | container |
 |---|---|
 | `/var/lib/ablab-runner/workspaces/<id>` | `/workspace[:rw|:ro]` |
-| `/var/lib/ablab-runner/trusted` | `/trusted:ro` |
+| `/var/lib/ablab-runner/trusted` | `/trusted:ro` (hidden tests; rejected together with `/workspace`) |
+| `/var/lib/ablab-runner/launcher` | `/launcher:ro` (`serve.mjs` only) |
 | `/var/lib/ablab-runner/run/secrets/<id>` | `/secret:ro` |
 | `/var/lib/ablab-runner/run/sock/<id>` | `/sock` |
 
@@ -66,19 +68,35 @@ Hard flags are appended **after** caller options: `--network none --cap-drop ALL
 --security-opt no-new-privileges:true --security-opt seccomp=config/seccomp-default.json
 --user 65534:65534 --init --pids-limit 256 --memory 2g --memory-swap 2g --cpus 2
 --ulimit nofile=1024 core=0 fsize=256MiB --read-only` + noexec tmpfs `/tmp`, `/run`.
-The installer enables `userns-remap: default` and daemon-wide `no-new-privileges`.
+The installer enables daemon-wide `no-new-privileges`. `userns-remap: default` is **opt-in**
+(`ABL_USERNS_REMAP=1`); the default install leaves it off.
 
 ## Verifier (`bin/ablab-verify`)
 
 Worker code and test code never share a process or container:
 
+0. Before anything in the workspace is copied or opened, it is walked with `lstat`. Any entry
+   that is not a regular file or a real directory (symlink, FIFO, socket, device) is listed in
+   `protected.json` → `special_files`; the attempt is rejected (`protected_ok: false`,
+   `rejected: "special_files"`) and no verifier container is started.
 1. `vbuild`: `node --check` on a read-only copy (parses only).
-2. `vsrv`: trusted `/trusted/serve.mjs` imports the worker server and listens on a unix socket.
+2. `vsrv`: trusted `/launcher/serve.mjs` imports the worker server and listens on a unix socket.
+   This container gets `/launcher` (that one file) and **not** `/trusted`.
 3. `vvis` / `vhid`: trusted test client containers (no workspace mount) run
    `/trusted/{visible,hidden}.test.mjs` over the socket with the TAP reporter.
 4. TAP is parsed **by test name** against `expected.json`; exit codes are never trusted.
 5. Every baseline file except `editable_files` is compared by sha256 (`protected.json`).
-6. sha256 of `/var/lib/ablab-runner/trusted` is recorded before/after every attempt.
+6. sha256 of `/var/lib/ablab-runner/trusted` and `/launcher` is recorded before/after every attempt.
+
+Hidden tests live only in `/var/lib/ablab-runner/trusted`. That directory is mounted only into
+`vvis`/`vhid`, which start after the worker container has exited and been removed, and which hold
+no worker code. The worker container never gets it, and the cage rejects any container that asks
+for both `/workspace` and `/trusted`.
+
+Timeouts (`lib/common.sh`, not overridable from the environment): `vbuild`, the `vsrv` start and
+log collection 30 s each, each test client 60 s, and `ablab-run-attempt` kills the whole verifier
+after `VERIFY_TIMEOUT_SECS` (300 s). A killed verifier yields `verified.json` with
+`verifier_timeout: true`, `task_complete: false`, and `verify_timeout: true` in `result.json`.
 
 `exit_zero` is the regression worker for the old `process.exit(0)` bypass.
 
@@ -103,15 +121,17 @@ redacted (plain, base64, base32, hex, URL-encoded, reversed, `ablab_rt_*`); see 
 
 `.github/workflows/ci.yml`: shellcheck, ruff, `tests/` unit tests, and the full Docker selftest on
 a GitHub VM via `ABL_ALLOW_HOST=ci` (hostname override; installer skips dockerd reconfiguration, so
-userns-remap is **not** exercised in CI — only on a-lab).
+userns-remap is **not** exercised in CI; it is opt-in everywhere).
 
 ## Known, intentionally not changed
 
 - This repository is **public**. That is acceptable only because it contains scripted fixtures
   and placeholders, never tokens. Consider making it private before real benchmarks exist.
 - `fixtures/health-service/trusted/hidden.test.mjs` is public, so it is **not secret**. Real
-  benchmark hidden tests must live in a private store and be mounted into `/trusted` at install time.
-- `tamper_verifier` gets `/trusted:ro` mounted on purpose so the read-only mount itself is tested.
+  benchmark hidden tests must live in a private store and be placed in
+  `/var/lib/ablab-runner/trusted` at install time (test-client containers only, see Verifier).
+- `tamper_verifier` gets `/launcher:ro` mounted on purpose so the read-only mount itself is tested;
+  it also proves `/trusted` is absent from the worker container.
 
 ## Lifecycle
 
@@ -148,9 +168,10 @@ Local pure-data integration only. `kind: HARNESS_TEST`, `ranking_eligible: false
 
 a-lab also hosts other projects' images and containers (listing-prep-studio contract images,
 postgres, a buildx builder). `userns-remap` would hide them (Docker stores remapped data under a
-separate root), so install with `ABL_USERNS_REMAP=0`. All other cage hardening still applies.
+separate root), so the installer leaves it off unless `ABL_USERNS_REMAP=1` is given (do **not**
+set that on a-lab). All other cage hardening still applies.
 The installer backs up and **merges** `/etc/docker/daemon.json` (existing keys kept; `icc:false` and
-`no-new-privileges:true` enforced; `userns-remap` never added in this mode, never removed) and
+`no-new-privileges:true` enforced; `userns-remap` never added by default, never removed) and
 restarts Docker **only** if `daemon.json` or the dockerd drop-in actually changed. With
 `live-restore: true`, running containers survive that restart.
 
@@ -164,7 +185,7 @@ sudo /var/lib/ablab-runner/bin/ablab-stop-all
 TS=$(date -u +%Y%m%dT%H%M%SZ); BK=/root/ablab-backup-$TS; sudo mkdir -p "$BK"
 sudo tar -C / -czf "$BK/ablab.tgz" --ignore-failed-read \
   var/lib/ablab-runner/bin var/lib/ablab-runner/lib var/lib/ablab-runner/fixtures \
-  var/lib/ablab-runner/trusted var/lib/ablab-runner/schema var/lib/ablab-runner/docs \
+  var/lib/ablab-runner/trusted var/lib/ablab-runner/launcher var/lib/ablab-runner/schema var/lib/ablab-runner/docs \
   var/lib/ablab-runner/INSTALLED_COMMIT var/lib/ablab-runner/INSTALLED_VERSION \
   usr/local/bin/ablab-cage-run etc/systemd/system/ablab-poller.service \
   etc/docker/daemon.json etc/systemd/system/docker.service.d etc/ablab/poller.env
@@ -176,7 +197,7 @@ echo "backup: $BK"
 ```bash
 cd /tmp && rm -rf a-lab-harness && git clone https://github.com/simaan5/a-lab-harness.git
 cd a-lab-harness && git checkout hardening/audit-2026-10-12 && git rev-parse HEAD
-sudo ABL_USERNS_REMAP=0 bash ./install-host.sh
+sudo bash ./install-host.sh   # userns-remap stays off (default)
 sudo docker ps -a --format '{{.Names}} {{.Status}}' | diff "$BK/containers-before.txt" - && echo "containers unchanged"
 ```
 
