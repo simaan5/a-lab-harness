@@ -20,6 +20,12 @@ sudo ./install-host.sh
 
 Confirm SOURCE COMMIT equals INSTALLED COMMIT.
 
+Docker `userns-remap` is **off by default**: a plain install never adds it, because enabling it
+hides every existing image and container on the host. Opt in on a dedicated Docker host with
+`sudo ABL_USERNS_REMAP=1 ./install-host.sh` (pass the variable on the `sudo` command line; `sudo`
+drops exported variables). The installer still merges its other `daemon.json` keys and restarts
+Docker if that file or the dockerd drop-in changed — see `docs/RUNNER.md`.
+
 ## Connect the poller (Phase 5)
 
 On the Benchmark Lab **Runners** page: Issue runner token.

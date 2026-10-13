@@ -169,7 +169,7 @@ note "WORKDIR=$WORKDIR"
 USERNS="$(userns_mode)"
 note "userns_remap=$USERNS"
 if [ "$USERNS" = "off" ]; then
-  note "WARNING: userns_remap=off — container uid 65534 maps to host uid 65534 (ABL_USERNS_REMAP=0 install). Other cage hardening still enforced."
+  note "WARNING: userns_remap=off — container uid 65534 maps to host uid 65534 (installer default; opt in with ABL_USERNS_REMAP=1). Other cage hardening still enforced."
 fi
 note "=================================================="
 

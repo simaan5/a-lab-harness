@@ -68,7 +68,8 @@ Hard flags are appended **after** caller options: `--network none --cap-drop ALL
 --security-opt no-new-privileges:true --security-opt seccomp=config/seccomp-default.json
 --user 65534:65534 --init --pids-limit 256 --memory 2g --memory-swap 2g --cpus 2
 --ulimit nofile=1024 core=0 fsize=256MiB --read-only` + noexec tmpfs `/tmp`, `/run`.
-The installer enables `userns-remap: default` and daemon-wide `no-new-privileges`.
+The installer enables daemon-wide `no-new-privileges`. `userns-remap: default` is **opt-in**
+(`ABL_USERNS_REMAP=1`); the default install leaves it off.
 
 ## Verifier (`bin/ablab-verify`)
 
@@ -120,7 +121,7 @@ redacted (plain, base64, base32, hex, URL-encoded, reversed, `ablab_rt_*`); see 
 
 `.github/workflows/ci.yml`: shellcheck, ruff, `tests/` unit tests, and the full Docker selftest on
 a GitHub VM via `ABL_ALLOW_HOST=ci` (hostname override; installer skips dockerd reconfiguration, so
-userns-remap is **not** exercised in CI — only on a-lab).
+userns-remap is **not** exercised in CI; it is opt-in everywhere).
 
 ## Known, intentionally not changed
 
@@ -167,9 +168,10 @@ Local pure-data integration only. `kind: HARNESS_TEST`, `ranking_eligible: false
 
 a-lab also hosts other projects' images and containers (listing-prep-studio contract images,
 postgres, a buildx builder). `userns-remap` would hide them (Docker stores remapped data under a
-separate root), so install with `ABL_USERNS_REMAP=0`. All other cage hardening still applies.
+separate root), so the installer leaves it off unless `ABL_USERNS_REMAP=1` is given (do **not**
+set that on a-lab). All other cage hardening still applies.
 The installer backs up and **merges** `/etc/docker/daemon.json` (existing keys kept; `icc:false` and
-`no-new-privileges:true` enforced; `userns-remap` never added in this mode, never removed) and
+`no-new-privileges:true` enforced; `userns-remap` never added by default, never removed) and
 restarts Docker **only** if `daemon.json` or the dockerd drop-in actually changed. With
 `live-restore: true`, running containers survive that restart.
 
@@ -195,7 +197,7 @@ echo "backup: $BK"
 ```bash
 cd /tmp && rm -rf a-lab-harness && git clone https://github.com/simaan5/a-lab-harness.git
 cd a-lab-harness && git checkout hardening/audit-2026-10-12 && git rev-parse HEAD
-sudo ABL_USERNS_REMAP=0 bash ./install-host.sh
+sudo bash ./install-host.sh   # userns-remap stays off (default)
 sudo docker ps -a --format '{{.Names}} {{.Status}}' | diff "$BK/containers-before.txt" - && echo "containers unchanged"
 ```
 
