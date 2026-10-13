@@ -1,4 +1,5 @@
 // Trusted launcher: runs the WORKER's server in its own cage, listening on a unix socket.
+// Mounted alone at /launcher: hidden tests (/trusted) are never in this container.
 // The trusted test client runs in a different container and never imports worker code,
 // so worker code cannot fake test results (e.g. process.exit(0)).
 import fs from "node:fs";

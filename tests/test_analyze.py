@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import shutil
+import socket
 import tempfile
 import unittest
 from pathlib import Path
@@ -96,6 +97,56 @@ class Protected(unittest.TestCase):
         (self.ws / "src/server.mjs").unlink()
         os.symlink("/etc/passwd", self.ws / "src/server.mjs")
         self.assertFalse(self.check()["protected_ok"])
+
+
+    def test_fifo_editable_caught_without_opening(self):
+        # A FIFO has no writer: anything that open()s it would block forever.
+        (self.ws / "src/server.mjs").unlink()
+        os.mkfifo(self.ws / "src/server.mjs")
+        r = self.check()
+        self.assertFalse(r["protected_ok"])
+        self.assertEqual(r["special_files"], [{"path": "src/server.mjs", "type": "fifo"}])
+
+    def test_special_files_types(self):
+        os.symlink("/etc", self.ws / "node_modules")          # symlink to a directory
+        os.symlink("nowhere", self.ws / "src/dangling")       # dangling symlink
+        os.mkfifo(self.ws / "src/pipe")
+        s = socket.socket(socket.AF_UNIX)
+        try:
+            s.bind(str(self.ws / "src/sock"))
+        finally:
+            s.close()
+        (self.ws / "src/deep").mkdir()
+        os.mkfifo(self.ws / "src/deep/pipe")
+        got = {e["path"]: e["type"] for e in A.special_files(str(self.ws))}
+        self.assertEqual(got, {"node_modules": "symlink", "src/dangling": "symlink", "src/pipe": "fifo",
+                               "src/sock": "socket", "src/deep/pipe": "fifo"})
+        self.assertFalse(self.check()["protected_ok"])
+
+    def test_regular_tree_has_no_special_files(self):
+        (self.ws / "src/extra").mkdir()
+        (self.ws / "src/extra/a.mjs").write_text("")
+        self.assertEqual(A.special_files(str(self.ws)), [])
+        self.assertEqual(self.check()["special_files"], [])
+
+    def test_special_gate(self):
+        self.assertIsNone(A.special_gate(self.check()))
+        os.mkfifo(self.ws / "src/pipe")
+        doc = A.special_gate(self.check())
+        self.assertEqual((doc["rejected"], doc["task_complete"], doc["protected_ok"], doc["build_passed"]),
+                         ("special_files", False, False, False))
+
+    def test_special_gate_cli(self):
+        os.mkfifo(self.ws / "src/pipe")
+        prot, out = self.d / "protected.json", self.d / "verified.json"
+        A.write_json(str(prot), self.check())
+        self.assertEqual(A.main(["x", "special-gate", str(prot), str(out)]), 4)
+        self.assertEqual(json.loads(out.read_text())["rejected"], "special_files")
+        out.unlink()
+        os.unlink(self.ws / "src/pipe")
+        A.write_json(str(prot), self.check())
+        self.assertEqual(A.main(["x", "special-gate", str(prot), str(out)]), 0)
+        self.assertFalse(out.exists())
 
 
 class Redaction(unittest.TestCase):

@@ -26,7 +26,8 @@ VERSION="$(cat "$SRC/VERSION")"
 
 for f in bin/ablab-run-attempt bin/ablab-harness-selftest bin/ablab-cage-run bin/ablab-verify bin/ablab-poller \
          lib/analyze.py lib/common.sh lib/daemon_config.py config/images.lock config/seccomp-default.json \
-         fixtures/workers/manifest.json fixtures/health-service/baseline/src/server.mjs; do
+         fixtures/workers/manifest.json fixtures/health-service/baseline/src/server.mjs \
+         fixtures/health-service/launcher/serve.mjs; do
   [ -e "$SRC/$f" ] || { echo "INSTALL FAIL: missing $f" >&2; exit 1; }
 done
 python3 - "$SRC" <<'PY'
@@ -96,6 +97,9 @@ cp -a "$SRC/bin" "$SRC/lib" "$SRC/schema" "$SRC/docs" "$SRC/fixtures" "$SRC/conf
 cp -a "$SRC/VERSION" "$ROOT/VERSION"
 rm -rf "$ROOT/trusted"; mkdir -p "$ROOT/trusted"
 cp -a "$ROOT/fixtures/health-service/trusted/." "$ROOT/trusted/"
+# Launcher (serve.mjs only) is the one trusted dir mounted next to worker code; tests stay in trusted/.
+rm -rf "$ROOT/launcher"; mkdir -p "$ROOT/launcher"
+cp -a "$ROOT/fixtures/health-service/launcher/." "$ROOT/launcher/"
 install -m 0755 "$ROOT/bin/ablab-cage-run" /usr/local/bin/ablab-cage-run
 sed -i 's/\r$//' "$ROOT/bin/"* "$ROOT/lib/common.sh" "$ROOT/lib/analyze.py" || true
 chown -R root:root "$ROOT"
@@ -103,8 +107,8 @@ chmod 0755 "$ROOT" "$ROOT/bin/"* "$ROOT/lib/analyze.py"
 chmod 0644 "$ROOT/lib/common.sh"
 chmod 0711 "$ROOT/workspaces" "$ROOT/run/secrets" "$ROOT/run/sock"
 chmod 0750 "$ROOT/evidence" && chgrp ablab "$ROOT/evidence"
-chmod 0755 "$ROOT/run" "$ROOT/trusted"
-find "$ROOT/trusted" -type f -exec chmod 0644 {} +
+chmod 0755 "$ROOT/run" "$ROOT/trusted" "$ROOT/launcher"
+find "$ROOT/trusted" "$ROOT/launcher" -type f -exec chmod 0644 {} +
 
 if [ ! -f /etc/ablab/HOST_CANARY.txt ]; then
   echo "HOST_SECRET_CANARY_DO_NOT_LEAK" >/etc/ablab/HOST_CANARY.txt
