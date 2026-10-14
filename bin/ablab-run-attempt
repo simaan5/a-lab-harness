@@ -118,6 +118,27 @@ cat >"$manifest" <<EOF2
 }
 EOF2
 
+# Harness-side pids sampler: records the max of the container cgroup's pids.events `max`
+# counter (fork refusals at --pids-limit). Written into evidence by the harness, not the worker.
+pids_watch() {
+  local cid="$1" out="$2" f="" c m=0 v
+  for _ in $(seq 1 25); do
+    for c in "/sys/fs/cgroup/system.slice/docker-${cid}.scope" "/sys/fs/cgroup/docker/${cid}" \
+             "/sys/fs/cgroup/pids/docker/${cid}" "/sys/fs/cgroup/pids/system.slice/docker-${cid}.scope"; do
+      if [ -f "$c/pids.events" ]; then f="$c/pids.events"; break 2; fi
+    done
+    sleep 0.2
+  done
+  if [ -z "$f" ]; then echo unavailable >"$out"; return 0; fi
+  echo 0 >"$out"
+  while [ -f "$f" ]; do
+    v="$(awk '$1=="max"{print $2}' "$f" 2>/dev/null)"
+    if [ -n "$v" ] && [ "$v" -gt "$m" ] 2>/dev/null; then m="$v"; echo "$m" >"$out"; fi
+    sleep 0.2
+  done
+  return 0
+}
+
 state EXECUTING
 timeout_hit=0
 cancelled=0
@@ -126,6 +147,8 @@ exec_rc=-1
 start_s=$(date +%s)
 if "$CAGE" --name "$NAME" -d -v "${WS}:/workspace:rw" "${extra[@]}" -w /workspace \
     "$IMAGE" node /workspace/.ablab/worker.mjs >"$EV/container_id" 2>"$EV/cage.err"; then
+  pids_watch "$(head -c 64 "$EV/container_id")" "$EV/pids.events.max" &
+  pids_watch_pid=$!
   wait_out="$(timeout "$TIMEOUT_SECS" docker wait "$NAME" 2>/dev/null)"
   wrc=$?
   if [ "$wrc" -eq 124 ]; then
@@ -160,6 +183,12 @@ elif [ "$oom_killed" = "true" ]; then
   timeout_hit=0
 fi
 docker rm -f "$NAME" >/dev/null 2>&1
+if [ -n "${pids_watch_pid:-}" ]; then
+  # cgroup is gone after rm; give the sampler a moment to notice, then stop it.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$pids_watch_pid" 2>/dev/null || break; sleep 0.2; done
+  kill "$pids_watch_pid" 2>/dev/null; wait "$pids_watch_pid" 2>/dev/null
+fi
+[ -f "$EV/pids.events.max" ] || echo unavailable >"$EV/pids.events.max"
 end_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 state COLLECTING
@@ -208,8 +237,6 @@ fi
 leftover="$(docker ps -aq --filter name="$NAME" 2>/dev/null | wc -l)"
 [ "$leftover" -eq 0 ] || cleanup_ok=0
 
-python3 "$PY" finalize "$EV/verified.json" "$EV/claim.parsed.json" "$cleanup_ok" "$constraint" "$EV/score.json" >/dev/null 2>&1
-
 python3 - "$EV/result.json" "$ATT" "$WORKER_ID" "$EV/state" "$exec_rc" "$timeout_hit" "$cancelled" "$oom_killed" \
   "$cleanup_ok" "$canary_ok" "$((end_s - start_s))" "$start_iso" "$end_iso" "$KEEP" "$WS" "$trusted_before" "$trusted_after" <<'PY'
 import json, os, sys
@@ -231,6 +258,18 @@ PY
 
 # Redact every evidence file (all encodings of the synthetic secret, runner tokens).
 python3 "$PY" redact-dir "$EV" "$SECRET" "$EV/redaction.meta.json" >/dev/null 2>&1
+
+# Structured integrity signals (ablab.violations.v1) from harness evidence; merged into
+# result.json so the control plane judges from evidence, not worker name. Then score.
+if python3 "$PY" violations "$EV" "$EV/pids.events.max" "$EV/violations.json" >/dev/null 2>"$EV/violations.err"; then
+  python3 "$PY" merge-key "$EV/result.json" violations "$EV/violations.json" >/dev/null 2>&1
+  rm -f "$EV/violations.err"
+  python3 "$PY" finalize "$EV/verified.json" "$EV/claim.parsed.json" "$cleanup_ok" "$constraint" "$EV/score.json" "$EV/violations.json" >/dev/null 2>&1
+else
+  printf '%s\n' '{"schema":"ablab.violations.v1","error":"violations_failed","list":["harness_error"],"sources":{}}' >"$EV/violations.json"
+  python3 "$PY" merge-key "$EV/result.json" violations "$EV/violations.json" >/dev/null 2>&1
+  python3 "$PY" finalize "$EV/verified.json" "$EV/claim.parsed.json" "$cleanup_ok" "$constraint" "$EV/score.json" "$EV/violations.json" >/dev/null 2>&1
+fi
 
 # Non-root poller (group ablab) may read evidence; nobody else can.
 if getent group ablab >/dev/null 2>&1; then

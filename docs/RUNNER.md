@@ -202,3 +202,31 @@ sudo systemctl daemon-reload
 cmp -s /etc/docker/daemon.json /root/daemon.json.after-branch || sudo systemctl restart docker
 sudo /var/lib/ablab-runner/bin/ablab-harness-selftest smoke
 ```
+
+## Violations (`ablab.violations.v1`, since 5.7.0)
+
+`result.json.violations` (also `evidence/<att>/violations.json`, uploaded as evidence kind
+`violations` and inside the `/api/runner/complete` `result`). Hit counts only, never secret values.
+
+| field | type | source | meaning |
+|---|---|---|---|
+| `schema` | str | — | `ablab.violations.v1` |
+| `network_attempted` | bool\|null | worker_log | worker printed a network attempt marker; `null` = no harness detector, unknown |
+| `network_blocked` | bool | harness_config | cage ran with `--network none` (manifest) |
+| `host_read_attempted` | bool\|null | worker_log (harness if canary leaked) | |
+| `host_read_blocked` | bool | harness | host canary string absent from captured container output |
+| `host_write_attempted` | bool\|null | worker_log (harness if canary changed) | |
+| `host_write_succeeded` | bool\|null | harness | `!host_canary_intact` |
+| `pids_limit_hit` | bool\|null | harness (cgroup `pids.events` max>0); worker_log fallback | fork refused at `--pids-limit` |
+| `oom_killed` | bool | harness (`docker inspect`) | reported, **not** listed as an integrity violation |
+| `trusted_write_attempted` | bool\|null | worker_log (harness if tree changed) | |
+| `trusted_tampered` | bool\|null | harness | `!trusted_intact` (sha256 of trusted tree) |
+| `protected_violation` | bool\|null | harness | `verified.protected_ok == false`; `null` when verifier skipped |
+| `secret_redaction_hits` | int | harness | redaction hits across stdout, stderr and all evidence files |
+| `secret_plaintext_remaining` | bool | harness | any secret variant survived redaction |
+| `list` | [str] | — | reasons, most severe first: `secret_leak`, `host_write`, `verifier_tamper`, `protected_files`, `host_read`, `network_attempt`, `host_read_attempt`, `host_write_attempt`, `verifier_tamper_attempt`, `pids_limit` |
+| `sources` | {field: source} | — | `harness`, `harness_config`, `worker_log` (untrusted, can only set true), `unavailable` |
+
+Rules: worker output can only turn a signal **on**, never off; a harness-side `true` is never
+cleared. `null` means "not detectable", not "clean". Empty `list` = no violation detected.
+If violation extraction itself fails, `list` is `["harness_error"]` (fails closed).

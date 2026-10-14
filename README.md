@@ -2,7 +2,7 @@
 
 Dedicated host only (`hostname` must be `a-lab`).
 
-Version: see `VERSION`. Poller talks to the control plane over **HTTPS outbound only**.
+Version: see `VERSION`. Result payload schema (incl. `violations`): `docs/RUNNER.md`; changes: `CHANGELOG.md`. Poller talks to the control plane over **HTTPS outbound only**.
 
 No Claude, Grok, Codex, or provider keys.
 

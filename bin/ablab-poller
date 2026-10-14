@@ -251,6 +251,7 @@ def post_artifacts(base: str, token: str, job_id: str, result: dict) -> None:
             ("score", "score.json"),
             ("manifest", "manifest.json"),
             ("claim", "claim.parsed.json"),
+            ("violations", "violations.json"),
         ):
             payload = load_json(evid / name)
             if payload:
