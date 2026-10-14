@@ -216,12 +216,24 @@ def supervise_attempt(base: str, token: str, job_id: str, worker: str, timeout: 
             parsed = {}
     evid = Path(str(parsed.get("evidence_dir") or ""))
     result = load_json(evid / "result.json") if evid else {}
-    if not result:
+    score_doc = load_json(evid / "score.json") if evid else {}
+    viol = result.get("violations")
+    sc = score_doc.get("score")
+    valid = (isinstance(viol, dict) and isinstance(viol.get("list"), list)
+             and isinstance(sc, dict) and isinstance(sc.get("score"), int))
+    if not result or (not valid and parsed.get("status") != "REFUSED_STOP_ALL"):
+        # Missing/invalid result or score: never report a normal completion.
         result = {
             "kind": "HARNESS_TEST",
             "model": None,
-            "status": parsed.get("status") or "ERROR",
-            "attempt_id": parsed.get("attempt_id") or parsed.get("attempt"),
+            "status": "HARNESS_ERROR",
+            "state": "HARNESS_ERROR",
+            "attempt_id": parsed.get("attempt_id") or parsed.get("attempt") or result.get("attempt_id"),
+            "violations": {"schema": "ablab.violations.v1", "error": "poller_missing_or_invalid_evidence",
+                           "list": ["harness_error"], "sources": {}},
+            "score": {"kind": "HARNESS_TEST", "model": None, "ranking_eligible": False, "score": 0,
+                      "reason": "harness_error", "false_completion": None, "violations": ["harness_error"]},
+            "_harness_error": True,
         }
     result["kind"] = "HARNESS_TEST"
     result["model"] = None
@@ -253,6 +265,8 @@ def post_artifacts(base: str, token: str, job_id: str, result: dict) -> None:
             ("claim", "claim.parsed.json"),
             ("violations", "violations.json"),
         ):
+            if result.get("_harness_error") and kind in ("result", "score", "violations"):
+                continue  # local evidence missing/invalid; the fail-closed result goes in /complete
             payload = load_json(evid / name)
             if payload:
                 api(base, token, "/api/runner/evidence", {"job_id": job_id, "kind": kind, "payload": payload})
@@ -263,6 +277,7 @@ def post_artifacts(base: str, token: str, job_id: str, result: dict) -> None:
     if stdout:
         api(base, token, "/api/runner/logs", {"job_id": job_id, "seq": 1, "body": stdout})
     result.pop("_stderr", None)
+    result.pop("_harness_error", None)
     api(base, token, "/api/runner/complete", {"job_id": job_id, "result": result})
     api(base, token, "/api/runner/cleanup", {"job_id": job_id, "kind": "job"})
 
