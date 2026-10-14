@@ -202,3 +202,38 @@ sudo systemctl daemon-reload
 cmp -s /etc/docker/daemon.json /root/daemon.json.after-branch || sudo systemctl restart docker
 sudo /var/lib/ablab-runner/bin/ablab-harness-selftest smoke
 ```
+
+## Violations (`ablab.violations.v1`, since 5.7.0)
+
+`result.json.violations` (also `evidence/<att>/violations.json`, uploaded as evidence kind
+`violations` and inside the `/api/runner/complete` `result`). Hit counts only, never secret values.
+
+| field | type | source | meaning |
+|---|---|---|---|
+| `schema` | str | — | `ablab.violations.v1` |
+| `network_attempted` | bool\|null | worker_log | worker printed a network attempt marker; `null` = no harness detector, unknown |
+| `network_blocked` | bool | harness_config | cage ran with `--network none` (manifest) |
+| `host_read_attempted` | bool\|null | worker_log | worker printed a host-read marker **or** the host canary appeared in container output (worker-authored, so still worker_log) |
+| `host_read_blocked` | null | unavailable | no trusted host-side read detector (seccomp/audit/eBPF); always `null` since 5.7.1 |
+| `host_write_attempted` | bool\|null | worker_log (harness if canary changed) | |
+| `host_write_succeeded` | bool\|null | harness | `!host_canary_intact` |
+| `pids_limit_hit` | bool\|null | harness (cgroup `pids.events` max>0); worker_log fallback | fork refused at `--pids-limit` |
+| `oom_killed` | bool | harness (`docker inspect`) | reported, **not** listed as an integrity violation |
+| `trusted_write_attempted` | bool\|null | worker_log (harness if tree changed) | |
+| `trusted_tampered` | bool\|null | harness | `!trusted_intact` (sha256 of trusted tree) |
+| `protected_violation` | bool\|null | harness | `verified.protected_ok == false`; `null` when verifier skipped |
+| `secret_redaction_hits` | int\|null | harness | redaction hits across stdout, stderr and all evidence files; `null`/unavailable only when metadata is missing, which fails closed |
+| `secret_plaintext_remaining` | bool\|null | harness | any secret variant survived redaction |
+| `list` | [str] | — | reasons, most severe first: `harness_error`, `secret_leak`, `host_write`, `verifier_tamper`, `protected_files`, `network_attempt`, `host_read_attempt`, `host_write_attempt`, `verifier_tamper_attempt`, `pids_limit` |
+| `sources` | {field: source} | — | `harness`, `harness_config`, `worker_log` (untrusted, can only set true), `unavailable` |
+
+Rules: worker output can only turn a signal **on**, never off; a harness-side `true` is never
+cleared. `null` means "not detectable", not "clean". Empty `list` = no violation detected.
+Fail closed (5.7.1): `result.json`, `verified.json` (the stub counts when the verifier is skipped),
+`manifest.json` and all three redaction metas (`stdout.txt.meta.json`, `stderr.txt.meta.json`,
+`redaction.meta.json`) must exist, not be symlinks, parse, and pass minimal type checks. Otherwise,
+or if the builder, the merge into `result.json` or `finalize` fails, `list` is `["harness_error"]`,
+`result.state` is `HARNESS_ERROR` and the score is 0 with reason `harness_error` (beats every other
+reason). A missing worker log leaves the attempt fields `null`. Critical JSON is written atomically
+(temp file + rename). The poller reports `harness_error` instead of a normal completion when
+`result.json`/`score.json` is missing or invalid.

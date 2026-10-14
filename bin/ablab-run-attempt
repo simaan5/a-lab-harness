@@ -51,7 +51,7 @@ PY
 }
 
 if stop_all_requested; then
-  printf '%s\n' "{\"attempt\":\"$ATT\",\"attempt_id\":\"$ATT\",\"state\":\"REFUSED_STOP_ALL\",\"kind\":\"HARNESS_TEST\",\"model\":null}" >"$EV/result.json"
+  printf '%s\n' "{\"attempt\":\"$ATT\",\"attempt_id\":\"$ATT\",\"state\":\"REFUSED_STOP_ALL\",\"kind\":\"HARNESS_TEST\",\"model\":null,\"ranking_eligible\":false}" >"$EV/result.json"
   emit REFUSED_STOP_ALL
   exit 3
 fi
@@ -118,6 +118,44 @@ cat >"$manifest" <<EOF2
 }
 EOF2
 
+# Harness-side pids sampler: records the max of the container cgroup's pids.events `max`
+# counter (fork refusals at --pids-limit). Written into evidence by the harness, not the worker.
+pids_events_path() {
+  local cid="$1" c
+  for c in "/sys/fs/cgroup/system.slice/docker-${cid}.scope" "/sys/fs/cgroup/docker/${cid}" \
+           "/sys/fs/cgroup/pids/docker/${cid}" "/sys/fs/cgroup/pids/system.slice/docker-${cid}.scope"; do
+    if [ -f "$c/pids.events" ]; then printf '%s\n' "$c/pids.events"; return 0; fi
+  done
+  return 1
+}
+pids_watch() {
+  local cid="$1" out="$2" f="" c m=0 v
+  for _ in $(seq 1 25); do
+    for c in "/sys/fs/cgroup/system.slice/docker-${cid}.scope" "/sys/fs/cgroup/docker/${cid}" \
+             "/sys/fs/cgroup/pids/docker/${cid}" "/sys/fs/cgroup/pids/system.slice/docker-${cid}.scope"; do
+      if [ -f "$c/pids.events" ]; then f="$c/pids.events"; break 2; fi
+    done
+    sleep 0.2
+  done
+  if [ -z "$f" ]; then echo unavailable >"$out"; return 0; fi
+  echo 0 >"$out"
+  while [ -f "$f" ]; do
+    v="$(awk '$1=="max"{print $2}' "$f" 2>/dev/null)"
+    if [ -n "$v" ] && [ "$v" -gt "$m" ] 2>/dev/null; then m="$v"; echo "$m" >"$out"; fi
+    sleep 0.2
+  done
+  return 0
+}
+# Final synchronous read (container stopped, cgroup still present): closes the last-sample race.
+pids_final_read() {
+  local cid="$1" out="$2" f v cur
+  f="$(pids_events_path "$cid")" || return 0
+  v="$(awk '$1=="max"{print $2}' "$f" 2>/dev/null)"
+  [[ "$v" =~ ^[0-9]+$ ]] || return 0
+  cur="$(cat "$out" 2>/dev/null)"
+  if [[ ! "$cur" =~ ^[0-9]+$ ]] || [ "$v" -gt "$cur" ]; then echo "$v" >"$out"; fi
+}
+
 state EXECUTING
 timeout_hit=0
 cancelled=0
@@ -126,6 +164,8 @@ exec_rc=-1
 start_s=$(date +%s)
 if "$CAGE" --name "$NAME" -d -v "${WS}:/workspace:rw" "${extra[@]}" -w /workspace \
     "$IMAGE" node /workspace/.ablab/worker.mjs >"$EV/container_id" 2>"$EV/cage.err"; then
+  pids_watch "$(head -c 64 "$EV/container_id")" "$EV/pids.events.max" &
+  pids_watch_pid=$!
   wait_out="$(timeout "$TIMEOUT_SECS" docker wait "$NAME" 2>/dev/null)"
   wrc=$?
   if [ "$wrc" -eq 124 ]; then
@@ -159,7 +199,14 @@ if [ "$cancelled" -eq 1 ]; then
 elif [ "$oom_killed" = "true" ]; then
   timeout_hit=0
 fi
+if [ -n "${pids_watch_pid:-}" ]; then
+  # Container has exited (docker wait) but is not removed, so its cgroup may still exist:
+  # stop the sampler, then take one final synchronous reading before docker rm.
+  kill "$pids_watch_pid" 2>/dev/null; wait "$pids_watch_pid" 2>/dev/null
+  pids_final_read "$(head -c 64 "$EV/container_id")" "$EV/pids.events.max"
+fi
 docker rm -f "$NAME" >/dev/null 2>&1
+[ -f "$EV/pids.events.max" ] || echo unavailable >"$EV/pids.events.max"
 end_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 state COLLECTING
@@ -208,8 +255,6 @@ fi
 leftover="$(docker ps -aq --filter name="$NAME" 2>/dev/null | wc -l)"
 [ "$leftover" -eq 0 ] || cleanup_ok=0
 
-python3 "$PY" finalize "$EV/verified.json" "$EV/claim.parsed.json" "$cleanup_ok" "$constraint" "$EV/score.json" >/dev/null 2>&1
-
 python3 - "$EV/result.json" "$ATT" "$WORKER_ID" "$EV/state" "$exec_rc" "$timeout_hit" "$cancelled" "$oom_killed" \
   "$cleanup_ok" "$canary_ok" "$((end_s - start_s))" "$start_iso" "$end_iso" "$KEEP" "$WS" "$trusted_before" "$trusted_after" <<'PY'
 import json, os, sys
@@ -224,13 +269,45 @@ doc = {
   "duration_s": int(dur), "start": start, "end": end,
   "workspace_destroyed": (not os.path.isdir(ws)) if keep != "1" else False,
 }
-with open(path, "w", encoding="utf-8") as f:
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
     json.dump(doc, f, indent=2)
     f.write("\n")
+    f.flush()
+    os.fsync(f.fileno())
+os.replace(tmp, path)
 PY
 
 # Redact every evidence file (all encodings of the synthetic secret, runner tokens).
 python3 "$PY" redact-dir "$EV" "$SECRET" "$EV/redaction.meta.json" >/dev/null 2>&1
+
+# Structured integrity signals (ablab.violations.v1) from harness evidence; merged into
+# result.json so the control plane judges from evidence, not worker name. Then score.
+# finalize-evidence fails closed internally (missing/malformed trusted input, merge or finalize
+# failure -> harness_error, score 0). If it cannot even run, write a minimal trusted error here.
+fail_closed_shell() {
+  local t
+  t="$EV/.violations.json.tmp"
+  printf '%s\n' '{"schema":"ablab.violations.v1","error":"finalize_failed","list":["harness_error"],"sources":{}}' >"$t" && mv -f "$t" "$EV/violations.json"
+  t="$EV/.result.json.tmp"
+  printf '%s\n' "{\"attempt\":\"$ATT\",\"attempt_id\":\"$ATT\",\"worker_id\":\"$WORKER_ID\",\"kind\":\"HARNESS_TEST\",\"model\":null,\"ranking_eligible\":false,\"state\":\"HARNESS_ERROR\",\"violations\":{\"schema\":\"ablab.violations.v1\",\"error\":\"finalize_failed\",\"list\":[\"harness_error\"],\"sources\":{}}}" >"$t" && mv -f "$t" "$EV/result.json"
+  t="$EV/.score.json.tmp"
+  printf '%s\n' '{"false_completion":null,"score":{"kind":"HARNESS_TEST","model":null,"ranking_eligible":false,"score":0,"reason":"harness_error","false_completion":null,"violations":["harness_error"]}}' >"$t" && mv -f "$t" "$EV/score.json"
+}
+python3 "$PY" finalize-evidence "$EV" "$EV/pids.events.max" "$cleanup_ok" "$constraint" >/dev/null 2>"$EV/violations.err"
+fin_rc=$?
+if [ "$fin_rc" -ne 0 ]; then
+  echo "harness_error: finalize-evidence rc=$fin_rc" >&2
+  # Verify the fail-closed artefacts really exist and say harness_error; otherwise write them.
+  python3 -c '
+import json,sys
+r=json.load(open(sys.argv[1])); s=json.load(open(sys.argv[2]))
+assert "harness_error" in r["violations"]["list"] and s["score"]["score"]==0 and s["score"]["reason"]=="harness_error"
+' "$EV/result.json" "$EV/score.json" 2>/dev/null || fail_closed_shell
+  printf '%s\n' HARNESS_ERROR >"$EV/state"
+else
+  rm -f "$EV/violations.err"
+fi
 
 # Non-root poller (group ablab) may read evidence; nobody else can.
 if getent group ablab >/dev/null 2>&1; then
@@ -238,6 +315,6 @@ if getent group ablab >/dev/null 2>&1; then
 fi
 
 out_status="$(cat "$EV/state" 2>/dev/null || echo UNKNOWN)"
-[ "$cancelled" -eq 1 ] && out_status="CANCELLED"
+[ "$cancelled" -eq 1 ] && [ "$fin_rc" -eq 0 ] && out_status="CANCELLED"
 emit "$out_status"
 exit 0
