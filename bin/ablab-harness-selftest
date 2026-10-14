@@ -265,14 +265,17 @@ fi
 # --- FAIL-CLOSED: corrupt trusted evidence on a copy of the GOOD evidence dir ---
 # Runs the same trusted finalize-evidence step run-attempt uses; must yield harness_error + score 0.
 fail_closed_case() {
-  local label="$1" mutate="$2" d
+  local label="$1" d
   d="$WORKDIR/failclosed-$label"
   rm -rf "$d"; cp -a "$GOOD_EV" "$d"; rm -f "$d/violations.json" "$d/score.json"
   python3 - "$d/result.json" <<'PYS'
 import json,sys
 d=json.load(open(sys.argv[1])); d.pop("violations",None); json.dump(d,open(sys.argv[1],"w"))
 PYS
-  eval "$mutate"
+  case "$label" in
+    missing_redaction_meta) rm -f "$d/stdout.txt.meta.json" ;;
+    corrupt_verified) printf '{not json' >"$d/verified.json" ;;
+  esac
   if python3 "$PY" finalize-evidence "$d" "$d/pids.events.max" 1 0 >/dev/null 2>&1; then
     bad "FAIL-CLOSED $label: finalize-evidence returned 0"
   else
@@ -285,8 +288,8 @@ PYS
   expect_eq "$(jget "$d/result.json" ranking_eligible)" "False" "FAIL-CLOSED $label ranking_eligible false"
 }
 if [ -n "${GOOD_EV:-}" ] && [ -d "$GOOD_EV" ]; then
-  fail_closed_case missing_redaction_meta 'rm -f "$d/stdout.txt.meta.json"'
-  fail_closed_case corrupt_verified 'printf "{not json" >"$d/verified.json"'
+  fail_closed_case missing_redaction_meta
+  fail_closed_case corrupt_verified
 else
   blocked "FAIL-CLOSED (no GOOD evidence dir)"
 fi
